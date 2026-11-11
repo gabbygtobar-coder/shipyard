@@ -2,7 +2,8 @@
 //
 // M0 ships an in-memory implementation. M1 records image builds in the same
 // store: status, git ref, commit, image tag, timestamps, error text, and the
-// captured build log.
+// captured build log. M2 adds the running and stopped statuses, a public URL,
+// and the app's current routing status. That state is still only in memory.
 package store
 
 import (
@@ -28,19 +29,38 @@ const (
 	DeploymentStatusQueued = "queued"
 	// DeploymentStatusBuilding means a worker is cloning and building.
 	DeploymentStatusBuilding = "building"
-	// DeploymentStatusSucceeded means the image was built.
+	// DeploymentStatusSucceeded means the image was built and no runtime is
+	// configured to start it. With a runtime, a successful build moves to
+	// starting instead.
 	DeploymentStatusSucceeded = "succeeded"
-	// DeploymentStatusFailed means the build stopped with an error.
+	// DeploymentStatusStarting means the image was built and a container is
+	// waiting for the health check.
+	DeploymentStatusStarting = "starting"
+	// DeploymentStatusRunning means the container is healthy and receiving traffic.
+	DeploymentStatusRunning = "running"
+	// DeploymentStatusStopped means a running container was replaced or stopped.
+	DeploymentStatusStopped = "stopped"
+	// DeploymentStatusFailed means the build or the health gate stopped with an error.
 	DeploymentStatusFailed = "failed"
+
+	// AppStatusIdle means the app has no container receiving traffic.
+	AppStatusIdle = "idle"
+	// AppStatusRunning means traffic is routed to a healthy container.
+	AppStatusRunning = "running"
+	// AppStatusStopped means the last running container was stopped.
+	AppStatusStopped = "stopped"
 
 	// MaxDeploymentLogBytes is the captured build log kept per deployment.
 	MaxDeploymentLogBytes = 1 << 20
 )
 
 // App is a registered source repository.
+// Status and URL describe the in-memory routing state. They are not durable.
 type App struct {
 	Name      string    `json:"name"`
 	RepoURL   string    `json:"repo_url"`
+	Status    string    `json:"status"`
+	URL       string    `json:"url,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -53,6 +73,7 @@ type Deployment struct {
 	CommitSHA  string     `json:"commit_sha"`
 	Status     string     `json:"status"`
 	ImageTag   string     `json:"image_tag"`
+	URL        string     `json:"url,omitempty"`
 	Error      string     `json:"error"`
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
@@ -68,6 +89,7 @@ type DeploymentUpdate struct {
 	Ref        *string
 	CommitSHA  *string
 	ImageTag   *string
+	URL        *string
 	Error      *string
 	StartedAt  *time.Time
 	FinishedAt *time.Time
@@ -92,6 +114,9 @@ type Store interface {
 	GetApp(ctx context.Context, name string) (App, error)
 	// ListApps returns apps in creation order.
 	ListApps(ctx context.Context) ([]App, error)
+	// SetAppStatus records whether an app is idle, running, or stopped.
+	// A running app requires a public URL. Idle and stopped clear it.
+	SetAppStatus(ctx context.Context, name, status, appURL string) (App, error)
 
 	// CreateDeployment stores a deployment for an existing app.
 	// status must be 1-32 characters of lowercase letters, digits, '_' or '-'.
@@ -116,18 +141,28 @@ type Store interface {
 	WaitDeploymentLog(ctx context.Context, id string, offset int) error
 }
 
-// IsTerminalStatus reports whether a build has finished.
+// IsTerminalStatus reports whether log streaming can stop.
+// running can still move to stopped; succeeded, failed, and stopped cannot.
 func IsTerminalStatus(status string) bool {
-	return status == DeploymentStatusSucceeded || status == DeploymentStatusFailed
+	switch status {
+	case DeploymentStatusSucceeded, DeploymentStatusFailed, DeploymentStatusRunning, DeploymentStatusStopped:
+		return true
+	default:
+		return false
+	}
 }
 
-// CanTransition reports whether a build may move from one status to another.
+// CanTransition reports whether a deployment may move from one status to another.
 func CanTransition(from, to string) bool {
 	switch from {
 	case DeploymentStatusQueued:
 		return to == DeploymentStatusBuilding || to == DeploymentStatusFailed
 	case DeploymentStatusBuilding:
-		return to == DeploymentStatusSucceeded || to == DeploymentStatusFailed
+		return to == DeploymentStatusSucceeded || to == DeploymentStatusStarting || to == DeploymentStatusFailed
+	case DeploymentStatusStarting:
+		return to == DeploymentStatusRunning || to == DeploymentStatusFailed
+	case DeploymentStatusRunning:
+		return to == DeploymentStatusStopped
 	default:
 		return false
 	}

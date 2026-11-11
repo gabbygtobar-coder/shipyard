@@ -119,6 +119,26 @@ func (c *apiClient) streamLogs(ctx context.Context, id string, follow bool, dst 
 	return err
 }
 
+func (c *apiClient) appURL(ctx context.Context, name string) (string, error) {
+	var out struct {
+		URL string `json:"url"`
+	}
+	path := "/apps/" + url.PathEscape(name) + "/url"
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return "", err
+	}
+	return out.URL, nil
+}
+
+func (c *apiClient) stopApp(ctx context.Context, name string) (store.App, error) {
+	var app store.App
+	path := "/apps/" + url.PathEscape(name) + "/stop"
+	if err := c.do(ctx, http.MethodPost, path, nil, &app); err != nil {
+		return store.App{}, err
+	}
+	return app, nil
+}
+
 func (c *apiClient) getApp(ctx context.Context, name string) (store.App, error) {
 	var app store.App
 	path := "/apps/" + url.PathEscape(name)

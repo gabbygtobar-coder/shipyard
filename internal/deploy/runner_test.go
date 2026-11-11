@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/build"
+	"github.com/gabbygtobar-coder/shipyard/internal/runtime"
 	"github.com/gabbygtobar-coder/shipyard/internal/source"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
@@ -522,6 +523,87 @@ func TestRunnerRejectsBadRefAndMissingApp(t *testing.T) {
 	}
 	if _, err := runner.StartBuild(context.Background(), "missing", "main"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("missing app error = %v", err)
+	}
+}
+
+type scriptReleaser struct {
+	st    store.Store
+	err   error
+	calls int
+}
+
+func (s *scriptReleaser) Release(_ context.Context, appName, id, _ string, logs io.Writer) error {
+	s.calls++
+	_, _ = io.WriteString(logs, "released "+appName+"\n")
+	if s.err != nil {
+		return s.err
+	}
+	status := store.DeploymentStatusRunning
+	url := "http://" + appName + ".localhost:8081/"
+	now := time.Now().UTC()
+	_, err := s.st.UpdateDeployment(context.Background(), id, store.DeploymentUpdate{
+		Status:     &status,
+		URL:        &url,
+		FinishedAt: &now,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.st.SetAppStatus(context.Background(), appName, store.AppStatusRunning, url)
+	return err
+}
+
+func TestRunnerReleaseRunning(t *testing.T) {
+	t.Parallel()
+	st := store.NewMemory()
+	rel := &scriptReleaser{st: st}
+	runner, _ := startRunner(t, st, &source.Fake{Files: dockerfile()}, &build.Fake{}, func(cfg *Config) {
+		cfg.Releaser = rel
+	})
+	mustApp(t, st)
+	dep, err := runner.StartBuild(context.Background(), "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := waitStatus(t, st, dep.ID, store.DeploymentStatusRunning)
+	if got.URL != "http://demo.localhost:8081/" || got.ImageTag != testTag || rel.calls != 1 {
+		t.Fatalf("deployment %#v calls %d", got, rel.calls)
+	}
+	log := logText(t, st, dep.ID)
+	if !strings.Contains(log, "starting "+testTag) || !strings.Contains(log, "released demo") {
+		t.Fatalf("log %s", log)
+	}
+	app, err := st.GetApp(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Status != store.AppStatusRunning || app.URL != got.URL {
+		t.Fatalf("app %#v", app)
+	}
+}
+
+func TestRunnerReleaseHealthTimeout(t *testing.T) {
+	t.Parallel()
+	st := store.NewMemory()
+	rel := &scriptReleaser{st: st, err: runtime.ErrHealthTimeout}
+	runner, _ := startRunner(t, st, &source.Fake{Files: dockerfile()}, &build.Fake{}, func(cfg *Config) {
+		cfg.Releaser = rel
+	})
+	mustApp(t, st)
+	dep, err := runner.StartBuild(context.Background(), "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := waitStatus(t, st, dep.ID, store.DeploymentStatusFailed)
+	if got.Error != runtime.ErrHealthTimeout.Error() || got.ImageTag != testTag {
+		t.Fatalf("deployment %#v", got)
+	}
+	app, err := st.GetApp(context.Background(), "demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Status != store.AppStatusIdle {
+		t.Fatalf("app status %s", app.Status)
 	}
 }
 

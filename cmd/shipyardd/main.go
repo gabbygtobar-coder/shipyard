@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"os"
 	"os/signal"
@@ -18,6 +19,9 @@ import (
 	"github.com/gabbygtobar-coder/shipyard/internal/build"
 	"github.com/gabbygtobar-coder/shipyard/internal/config"
 	"github.com/gabbygtobar-coder/shipyard/internal/deploy"
+	"github.com/gabbygtobar-coder/shipyard/internal/proxy"
+	"github.com/gabbygtobar-coder/shipyard/internal/route"
+	"github.com/gabbygtobar-coder/shipyard/internal/runtime"
 	"github.com/gabbygtobar-coder/shipyard/internal/source"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
@@ -52,8 +56,16 @@ func run(args []string, stdout, stderr io.Writer) int {
 	buildTimeout := fs.Duration("build-timeout", flagDefaults.BuildTimeout, "time limit for clone and docker build (env "+config.EnvBuildTimeout+")")
 	cloneTimeout := fs.Duration("clone-timeout", flagDefaults.CloneTimeout, "time limit for git clone (env "+config.EnvCloneTimeout+")")
 	cloneMax := fs.Int64("clone-max-bytes", flagDefaults.CloneMaxBytes, "maximum cloned repository size in bytes (env "+config.EnvCloneMaxBytes+")")
+	proxyAddr := fs.String("proxy-addr", flagDefaults.ProxyAddr, "reverse proxy listen address (env "+config.EnvProxyAddr+")")
+	containerPort := fs.Int("container-port", flagDefaults.ContainerPort, "port inside the app container (env "+config.EnvContainerPort+")")
+	memoryBytes := fs.Int64("memory-bytes", flagDefaults.MemoryBytes, "app container memory limit in bytes (env "+config.EnvMemoryBytes+")")
+	cpus := fs.Float64("cpus", float64(flagDefaults.CPUMilli)/1000, "app container CPU limit (env "+config.EnvCPUs+")")
+	healthPath := fs.String("health-path", flagDefaults.HealthPath, "HTTP health path (env "+config.EnvHealthPath+")")
+	healthTimeout := fs.Duration("health-timeout", flagDefaults.HealthTimeout, "health gate time limit (env "+config.EnvHealthTimeout+")")
+	healthInterval := fs.Duration("health-interval", flagDefaults.HealthInterval, "delay between health probes (env "+config.EnvHealthInterval+")")
+	network := fs.String("runtime-network", flagDefaults.RuntimeNetwork, "docker network for app containers; empty publishes on 127.0.0.1 (env "+config.EnvRuntimeNetwork+")")
 	fs.Usage = func() {
-		fprintf(fs.Output(), "Usage: shipyardd [--addr %s]\n", config.DefaultAddr)
+		fprintf(fs.Output(), "Usage: shipyardd [--addr %s] [--proxy-addr %s]\n", config.DefaultAddr, config.DefaultProxyAddr)
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -73,11 +85,19 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	cfg := config.Config{
 		Addr:             *addr,
+		ProxyAddr:        *proxyAddr,
 		BuildConcurrency: *concurrency,
 		BuildQueueSize:   *queueSize,
 		BuildTimeout:     *buildTimeout,
 		CloneTimeout:     *cloneTimeout,
 		CloneMaxBytes:    *cloneMax,
+		ContainerPort:    *containerPort,
+		MemoryBytes:      *memoryBytes,
+		CPUMilli:         int(math.Round(*cpus * 1000)),
+		HealthPath:       *healthPath,
+		HealthTimeout:    *healthTimeout,
+		HealthInterval:   *healthInterval,
+		RuntimeNetwork:   *network,
 	}
 	if err := cfg.Check(); err != nil {
 		fprintf(stderr, "config: %s\n", err)
@@ -85,10 +105,45 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	st := store.NewMemory()
+	dockerRT := runtime.NewDocker()
+	reapCtx, reapCancel := context.WithTimeout(context.Background(), 20*time.Second)
+	if err := dockerRT.StopManaged(reapCtx); err != nil && !errors.Is(err, runtime.ErrDockerNotFound) {
+		logger.Error("stop old containers", "err", err)
+	}
+	reapCancel()
+
+	routes := route.NewTable()
+	supervisor, err := runtime.NewSupervisor(runtime.SupervisorConfig{
+		Store:   st,
+		Runtime: dockerRT,
+		Checker: runtime.HTTPChecker{
+			Path:     cfg.HealthPath,
+			Interval: cfg.HealthInterval,
+		},
+		Routes:        routes,
+		Port:          cfg.ContainerPort,
+		MemoryBytes:   cfg.MemoryBytes,
+		CPUMilli:      cfg.CPUMilli,
+		Network:       cfg.RuntimeNetwork,
+		HealthTimeout: cfg.HealthTimeout,
+		PublicURL: func(app string) string {
+			appURL, urlErr := proxy.PublicURL(cfg.ProxyAddr, app)
+			if urlErr != nil {
+				return ""
+			}
+			return appURL
+		},
+		Logger: logger,
+	})
+	if err != nil {
+		logger.Error("runtime", "err", err)
+		return 1
+	}
 	runner, err := deploy.New(deploy.Config{
 		Store:        st,
 		Cloner:       source.NewGit(cfg.CloneMaxBytes),
 		Builder:      build.NewDocker(),
+		Releaser:     supervisor,
 		Concurrency:  cfg.BuildConcurrency,
 		QueueSize:    cfg.BuildQueueSize,
 		BuildTimeout: cfg.BuildTimeout,
@@ -110,33 +165,53 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewHandler(st, runner, logger),
+		Handler:           api.NewHandler(st, runner, logger, supervisor),
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+	}
+	proxySrv := &http.Server{
+		Addr:              cfg.ProxyAddr,
+		Handler:           proxy.New(routes, logger),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
 	}
 
-	errCh := make(chan error, 1)
+	errCh := make(chan error, 2)
 	go func() {
-		logger.Info("listening", "addr", cfg.Addr, "build_concurrency", cfg.BuildConcurrency)
+		logger.Info("listening", "addr", cfg.Addr, "proxy_addr", cfg.ProxyAddr, "build_concurrency", cfg.BuildConcurrency)
 		errCh <- srv.ListenAndServe()
 	}()
+	go func() {
+		errCh <- proxySrv.ListenAndServe()
+	}()
+
+	shutdown := func() int {
+		runner.Stop()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		supervisor.Shutdown(shutdownCtx)
+		errAPI := srv.Shutdown(shutdownCtx)
+		errProxy := proxySrv.Shutdown(shutdownCtx)
+		if errAPI != nil || errProxy != nil {
+			logger.Error("shutdown", "api", errAPI, "proxy", errProxy)
+			return 1
+		}
+		return 0
+	}
 
 	select {
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			logger.Error("server failed", "err", err)
+			_ = shutdown()
 			return 1
 		}
 	case <-ctx.Done():
-		runner.Stop()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Error("shutdown", "err", err)
-			return 1
-		}
+		return shutdown()
 	}
 	return 0
 }

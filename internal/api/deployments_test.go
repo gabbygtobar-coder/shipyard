@@ -54,7 +54,7 @@ func newBuildAPI(t *testing.T, cloner source.Cloner, builder build.Builder, muta
 	}
 	t.Cleanup(runner.Stop)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewHandler(st, runner, logger), st
+	return NewHandler(st, runner, logger, nil), st
 }
 
 func waitDeployment(t *testing.T, st store.Store, id, status string) store.Deployment {

@@ -1,0 +1,22 @@
+# Runs shipyardd with the host Docker socket so it can build and start apps.
+# App containers join the shipyard network. The proxy reaches them by container name.
+services:
+  shipyardd:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      SHIPYARD_ADDR: ":8080"
+      SHIPYARD_PROXY_ADDR: ":8081"
+      SHIPYARD_RUNTIME_NETWORK: shipyard
+    networks:
+      - shipyard
+
+networks:
+  shipyard:
+    name: shipyard

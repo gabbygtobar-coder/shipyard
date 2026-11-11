@@ -10,11 +10,19 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		EnvAddr,
+		EnvProxyAddr,
 		EnvBuildConcurrency,
 		EnvBuildQueueSize,
 		EnvBuildTimeout,
 		EnvCloneTimeout,
 		EnvCloneMaxBytes,
+		EnvContainerPort,
+		EnvMemoryBytes,
+		EnvCPUs,
+		EnvHealthPath,
+		EnvHealthTimeout,
+		EnvHealthInterval,
+		EnvRuntimeNetwork,
 	} {
 		t.Setenv(key, "")
 	}
@@ -38,6 +46,18 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.CloneMaxBytes != DefaultCloneMaxBytes {
 		t.Fatalf("clone max = %d", cfg.CloneMaxBytes)
 	}
+	if cfg.ProxyAddr != DefaultProxyAddr || cfg.ContainerPort != DefaultContainerPort {
+		t.Fatalf("proxy %s port %d", cfg.ProxyAddr, cfg.ContainerPort)
+	}
+	if cfg.MemoryBytes != DefaultMemoryBytes || cfg.CPUMilli != DefaultCPUMilli {
+		t.Fatalf("limits memory %d cpu %d", cfg.MemoryBytes, cfg.CPUMilli)
+	}
+	if cfg.HealthPath != DefaultHealthPath || cfg.HealthTimeout != DefaultHealthTimeout || cfg.HealthInterval != DefaultHealthInterval {
+		t.Fatalf("health %#v", cfg)
+	}
+	if cfg.RuntimeNetwork != "" {
+		t.Fatalf("network %q", cfg.RuntimeNetwork)
+	}
 }
 
 func TestLoadFromEnv(t *testing.T) {
@@ -48,6 +68,14 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv(EnvBuildTimeout, "15m")
 	t.Setenv(EnvCloneTimeout, "30s")
 	t.Setenv(EnvCloneMaxBytes, "2097152")
+	t.Setenv(EnvProxyAddr, "127.0.0.1:9091")
+	t.Setenv(EnvContainerPort, "3000")
+	t.Setenv(EnvMemoryBytes, "67108864")
+	t.Setenv(EnvCPUs, "1.5")
+	t.Setenv(EnvHealthPath, "/healthz")
+	t.Setenv(EnvHealthTimeout, "20s")
+	t.Setenv(EnvHealthInterval, "250ms")
+	t.Setenv(EnvRuntimeNetwork, "shipyard")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -63,6 +91,18 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if cfg.CloneMaxBytes != 2<<20 {
 		t.Fatalf("clone max = %d", cfg.CloneMaxBytes)
+	}
+	if cfg.ProxyAddr != "127.0.0.1:9091" || cfg.ContainerPort != 3000 {
+		t.Fatalf("proxy %s port %d", cfg.ProxyAddr, cfg.ContainerPort)
+	}
+	if cfg.MemoryBytes != 64<<20 || cfg.CPUMilli != 1500 {
+		t.Fatalf("limits memory %d cpu %d", cfg.MemoryBytes, cfg.CPUMilli)
+	}
+	if cfg.HealthPath != "/healthz" || cfg.HealthTimeout != 20*time.Second || cfg.HealthInterval != 250*time.Millisecond {
+		t.Fatalf("health %#v", cfg)
+	}
+	if cfg.RuntimeNetwork != "shipyard" {
+		t.Fatalf("network %q", cfg.RuntimeNetwork)
 	}
 }
 
@@ -89,6 +129,13 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{key: EnvBuildTimeout, value: "10"},
 		{key: EnvBuildTimeout, value: "1ms"},
 		{key: EnvCloneMaxBytes, value: "10"},
+		{key: EnvContainerPort, value: "0"},
+		{key: EnvMemoryBytes, value: "10"},
+		{key: EnvCPUs, value: "nope"},
+		{key: EnvHealthPath, value: "health"},
+		{key: EnvHealthTimeout, value: "1ms"},
+		{key: EnvProxyAddr, value: "8081"},
+		{key: EnvRuntimeNetwork, value: "-bad"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+"="+tc.value, func(t *testing.T) {
@@ -98,6 +145,16 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 				t.Fatalf("error = %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadHealthIntervalCannotExceedTimeout(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv(EnvHealthTimeout, "1s")
+	t.Setenv(EnvHealthInterval, "1s")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), EnvHealthInterval) {
+		t.Fatalf("error = %v", err)
 	}
 }
 

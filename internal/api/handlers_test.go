@@ -23,7 +23,7 @@ func newTestHandler(t *testing.T) http.Handler {
 		return time.Date(2026, 11, 11, 3, 4, 5, 0, time.UTC)
 	})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return NewHandler(st, nil, logger)
+	return NewHandler(st, nil, logger, nil)
 }
 
 func doRequest(h http.Handler, method, path, body, contentType string) *httptest.ResponseRecorder {
@@ -231,7 +231,7 @@ func TestNilLoggerAndStoreErrors(t *testing.T) {
 			return nil, nil
 		},
 	}
-	h := NewHandler(st, nil, nil)
+	h := NewHandler(st, nil, nil, nil)
 	rec := doRequest(h, http.MethodGet, "/apps", "", "")
 	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), "null") {
 		t.Fatalf("nil list %d %s", rec.Code, rec.Body.String())
@@ -256,7 +256,7 @@ func TestNilLoggerAndStoreErrors(t *testing.T) {
 				get: func(context.Context, string) (store.App, error) {
 					return store.App{}, tc.err
 				},
-			}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+			}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 			rec := doRequest(handler, http.MethodGet, "/apps/demo", "", "")
 			if rec.Code != tc.wantStatus {
 				t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
@@ -277,7 +277,7 @@ func TestPanicBecomesInternalError(t *testing.T) {
 		create: func(context.Context, string, string) (store.App, error) {
 			panic("boom")
 		},
-	}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	}, nil, slog.New(slog.NewTextHandler(io.Discard, nil)), nil)
 	rec := doRequest(h, http.MethodPost, "/apps", `{"name":"demo","repo_url":"https://github.com/acme/demo"}`, jsonContentType)
 	if rec.Code != http.StatusInternalServerError || decodeError(t, rec) != errInternal {
 		t.Fatalf("panic result %d %s", rec.Code, rec.Body.String())
@@ -344,4 +344,8 @@ func (s stubStore) ReadDeploymentLog(context.Context, string, int) (store.LogRea
 
 func (s stubStore) WaitDeploymentLog(context.Context, string, int) error {
 	return errors.New("deployment not stubbed")
+}
+
+func (s stubStore) SetAppStatus(context.Context, string, string, string) (store.App, error) {
+	return store.App{}, errors.New("status not stubbed")
 }

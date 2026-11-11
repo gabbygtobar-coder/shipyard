@@ -41,7 +41,7 @@ func testAPI(t *testing.T) *httptest.Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(runner.Stop)
-	srv := httptest.NewServer(api.NewHandler(st, runner, logger))
+	srv := httptest.NewServer(api.NewHandler(st, runner, logger, nil))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -157,6 +157,10 @@ func TestCLIUsage(t *testing.T) {
 		{name: "create missing repo", args: []string{"apps", "create", "--name", "demo"}, want: 2},
 		{name: "list extra", args: []string{"apps", "list", "extra"}, want: 2},
 		{name: "get missing", args: []string{"apps", "get"}, want: 2},
+		{name: "url missing", args: []string{"apps", "url"}, want: 2},
+		{name: "url help", args: []string{"apps", "url", "-h"}, want: 0},
+		{name: "stop missing", args: []string{"stop"}, want: 2},
+		{name: "stop help", args: []string{"stop", "-h"}, want: 0},
 		{name: "flag after command", args: []string{"apps", "list", "--api-url", "http://example.com"}, want: 2},
 	}
 	for _, tt := range tests {
@@ -230,6 +234,62 @@ func TestCLIDeployListAndLogs(t *testing.T) {
 	code, _, stderr = runCLI(t, []string{"--api-url", srv.URL, "logs", "dep_9"}, getenv)
 	if code != 1 || !strings.Contains(stderr, "deployment not found") {
 		t.Fatalf("missing logs code %d stderr %s", code, stderr)
+	}
+}
+
+type stopStub struct {
+	st *store.Memory
+	id string
+}
+
+func (s stopStub) Stop(ctx context.Context, app string) (string, error) {
+	stopped := store.DeploymentStatusStopped
+	if _, err := s.st.UpdateDeployment(ctx, s.id, store.DeploymentUpdate{Status: &stopped}); err != nil {
+		return "", err
+	}
+	if _, err := s.st.SetAppStatus(ctx, app, store.AppStatusStopped, ""); err != nil {
+		return "", err
+	}
+	return s.id, nil
+}
+
+func TestCLIURLAndStop(t *testing.T) {
+	t.Parallel()
+	st := store.NewMemory()
+	if _, err := st.CreateApp(context.Background(), "demo", "https://github.com/acme/demo"); err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateDeployment(context.Background(), "demo", store.DeploymentStatusRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const publicURL = "http://demo.localhost:8081/"
+	if _, err := st.SetAppStatus(context.Background(), "demo", store.AppStatusRunning, publicURL); err != nil {
+		t.Fatal(err)
+	}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	srv := httptest.NewServer(api.NewHandler(st, nil, logger, stopStub{st: st, id: dep.ID}))
+	t.Cleanup(srv.Close)
+	getenv := func(string) string { return "" }
+
+	code, stdout, stderr := runCLI(t, []string{"--api-url", srv.URL, "apps", "url", "demo"}, getenv)
+	if code != 0 || stdout != publicURL+"\n" {
+		t.Fatalf("url code %d stdout %q stderr %s", code, stdout, stderr)
+	}
+	code, stdout, stderr = runCLI(t, []string{"--api-url", srv.URL, "stop", "demo"}, getenv)
+	if code != 0 {
+		t.Fatalf("stop code %d stderr %s", code, stderr)
+	}
+	var app store.App
+	if err := json.Unmarshal([]byte(stdout), &app); err != nil {
+		t.Fatal(err)
+	}
+	if app.Status != store.AppStatusStopped || app.URL != "" {
+		t.Fatalf("stopped %#v", app)
+	}
+	code, _, stderr = runCLI(t, []string{"--api-url", srv.URL, "apps", "url", "demo"}, getenv)
+	if code != 1 || !strings.Contains(stderr, "not running") {
+		t.Fatalf("url after stop code %d stderr %s", code, stderr)
 	}
 }
 

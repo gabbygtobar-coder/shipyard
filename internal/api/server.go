@@ -2,6 +2,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,31 +29,41 @@ const (
 	errContentType  = "content type must be application/json"
 	errCanceled     = "request canceled"
 
-	errDeploymentNotFound = "deployment not found"
-	errInvalidDeployment  = "invalid deployment"
-	errBuildsUnconfigured = "builds are not configured"
+	errDeploymentNotFound  = "deployment not found"
+	errInvalidDeployment   = "invalid deployment"
+	errBuildsUnconfigured  = "builds are not configured"
+	errRuntimeUnconfigured = "runtime is not configured"
 )
+
+// AppRuntime stops the container that is receiving traffic for an app.
+type AppRuntime interface {
+	Stop(ctx context.Context, appName string) (deploymentID string, err error)
+}
 
 // handler serves the shipyard HTTP API.
 type handler struct {
 	store  store.Store
 	builds deploy.BuildService
+	run    AppRuntime
 	log    *slog.Logger
 }
 
 // NewHandler returns the shipyard HTTP API.
 // st must be non-nil. builds may be nil, in which case deployment creation
 // returns 503 and the read routes still serve records already in st.
+// run may be nil, in which case stop returns 503.
 // A nil logger discards log output.
-func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger) http.Handler {
+func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger, run AppRuntime) http.Handler {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	h := &handler{store: st, builds: builds, log: logger}
+	h := &handler{store: st, builds: builds, run: run, log: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("POST /apps", h.createApp)
 	mux.HandleFunc("GET /apps", h.listApps)
+	mux.HandleFunc("GET /apps/{name}/url", h.appURL)
+	mux.HandleFunc("POST /apps/{name}/stop", h.stopApp)
 	mux.HandleFunc("GET /apps/{name}", h.getApp)
 	mux.HandleFunc("POST /apps/{name}/deployments", h.createDeployment)
 	mux.HandleFunc("GET /apps/{name}/deployments", h.listDeployments)

@@ -1,0 +1,27 @@
+# Local shipyardd image with git and the docker CLI.
+# Mount /var/run/docker.sock so the process can build and run app containers.
+# The distroless Dockerfile is the API-only image and does not include those tools.
+
+FROM golang:1.22.2-alpine AS build
+
+WORKDIR /src
+ENV CGO_ENABLED=0
+ENV GOTOOLCHAIN=local
+
+COPY go.mod ./
+COPY cmd ./cmd
+COPY internal ./internal
+
+RUN go build -trimpath -ldflags="-s -w" -o /out/shipyardd ./cmd/shipyardd \
+ && go build -trimpath -ldflags="-s -w" -o /out/shipyard ./cmd/shipyard
+
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates docker-cli git
+
+COPY --from=build /out/shipyardd /usr/local/bin/shipyardd
+COPY --from=build /out/shipyard /usr/local/bin/shipyard
+
+EXPOSE 8080 8081
+
+ENTRYPOINT ["/usr/local/bin/shipyardd"]

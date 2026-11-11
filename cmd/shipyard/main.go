@@ -18,19 +18,22 @@ import (
 
 const (
 	commandTimeout = 15 * time.Second
-	usageText      = `Shipyard registers applications and builds images with a shipyardd API.
+	usageText      = `Shipyard registers applications, builds images, and routes traffic to them.
 
 Usage:
   shipyard [--api-url URL] apps create --name NAME --repo URL
   shipyard [--api-url URL] apps list
   shipyard [--api-url URL] apps get NAME
+  shipyard [--api-url URL] apps url NAME
   shipyard [--api-url URL] deploy APP [--ref REF]
   shipyard [--api-url URL] deployments list APP
   shipyard [--api-url URL] logs DEPLOYMENT_ID [--follow]
+  shipyard [--api-url URL] stop APP
 
 The API base URL is taken from --api-url, then SHIPYARD_API_URL,
 then http://127.0.0.1:8080. An empty --ref builds the repository default branch.
 logs --follow streams until the build finishes and exits 1 when it fails.
+apps url prints the public URL. stop ends the container that is receiving traffic.
 
 `
 )
@@ -79,6 +82,8 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return runDeployments(rest[1:], client, stdout, stderr)
 	case "logs":
 		return runLogs(rest[1:], client, stdout, stderr)
+	case "stop":
+		return runStop(rest[1:], client, stdout, stderr)
 	default:
 		fprintf(stderr, "unknown command %q\n\n", rest[0])
 		fs.Usage()
@@ -88,7 +93,7 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 
 func runApps(args []string, client *apiClient, stdout, stderr io.Writer) int {
 	if len(args) == 0 {
-		fprintln(stderr, "usage: shipyard apps create|list|get")
+		fprintln(stderr, "usage: shipyard apps create|list|get|url")
 		return 2
 	}
 	switch args[0] {
@@ -98,6 +103,8 @@ func runApps(args []string, client *apiClient, stdout, stderr io.Writer) int {
 		return runAppsList(args[1:], client, stdout, stderr)
 	case "get":
 		return runAppsGet(args[1:], client, stdout, stderr)
+	case "url":
+		return runAppsURL(args[1:], client, stdout, stderr)
 	default:
 		fprintf(stderr, "unknown apps command %q\n", args[0])
 		return 2
@@ -179,6 +186,57 @@ func runAppsGet(args []string, client *apiClient, stdout, stderr io.Writer) int 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	app, err := client.getApp(ctx, fs.Arg(0))
+	if err != nil {
+		return writeCLIError(stderr, err)
+	}
+	return writeJSON(stdout, stderr, app)
+}
+
+func runAppsURL(args []string, client *apiClient, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("apps url", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fprintln(fs.Output(), "usage: shipyard apps url NAME")
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
+		fs.Usage()
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	appURL, err := client.appURL(ctx, strings.TrimSpace(fs.Arg(0)))
+	if err != nil {
+		return writeCLIError(stderr, err)
+	}
+	fprintf(stdout, "%s\n", appURL)
+	return 0
+}
+
+func runStop(args []string, client *apiClient, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fprintln(fs.Output(), "usage: shipyard stop APP")
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() != 1 || strings.TrimSpace(fs.Arg(0)) == "" {
+		fs.Usage()
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	app, err := client.stopApp(ctx, strings.TrimSpace(fs.Arg(0)))
 	if err != nil {
 		return writeCLIError(stderr, err)
 	}
@@ -306,7 +364,7 @@ func runLogs(args []string, client *apiClient, stdout, stderr io.Writer) int {
 	if err != nil {
 		return writeCLIError(stderr, err)
 	}
-	if dep.Status != store.DeploymentStatusSucceeded {
+	if dep.Status != store.DeploymentStatusSucceeded && dep.Status != store.DeploymentStatusRunning {
 		if dep.Error != "" {
 			return writeCLIError(stderr, errors.New(dep.Error))
 		}

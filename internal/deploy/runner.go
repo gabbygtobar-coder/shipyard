@@ -2,6 +2,7 @@
 //
 // A bounded worker pool clones the GitHub repository, requires a Dockerfile
 // at the repository root, and tags the image shipyard/<app>:<short-sha>.
+// When a Releaser is configured, a successful build is started and routed.
 package deploy
 
 import (
@@ -18,6 +19,7 @@ import (
 
 	"github.com/gabbygtobar-coder/shipyard/internal/build"
 	"github.com/gabbygtobar-coder/shipyard/internal/giturl"
+	"github.com/gabbygtobar-coder/shipyard/internal/runtime"
 	"github.com/gabbygtobar-coder/shipyard/internal/source"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
@@ -37,6 +39,7 @@ const (
 	msgDockerfileNotFile = "dockerfile must be a regular file at the repository root"
 	msgInvalidSHA        = "invalid commit sha"
 	msgInternal          = "internal error"
+	msgContainerStart    = "container start failed"
 )
 
 var (
@@ -53,12 +56,21 @@ type BuildService interface {
 	StartBuild(ctx context.Context, appName, ref string) (store.Deployment, error)
 }
 
+// Releaser starts a built image and routes traffic to it.
+// On success the deployment status is running.
+// On failure the new container is stopped and the deployment is left starting.
+type Releaser interface {
+	Release(ctx context.Context, appName, deploymentID, image string, logs io.Writer) error
+}
+
 // Config configures a Runner.
 // Zero concurrency, queue size, and timeouts are replaced with defaults.
+// A nil Releaser keeps the M1 behavior: a built image is marked succeeded.
 type Config struct {
 	Store        store.Store
 	Cloner       source.Cloner
 	Builder      build.Builder
+	Releaser     Releaser
 	Concurrency  int
 	QueueSize    int
 	BuildTimeout time.Duration
@@ -72,6 +84,7 @@ type Runner struct {
 	store        store.Store
 	cloner       source.Cloner
 	builder      build.Builder
+	releaser     Releaser
 	concurrency  int
 	queueCap     int
 	buildTimeout time.Duration
@@ -118,6 +131,7 @@ func New(cfg Config) (*Runner, error) {
 		store:        cfg.Store,
 		cloner:       cfg.Cloner,
 		builder:      cfg.Builder,
+		releaser:     cfg.Releaser,
 		concurrency:  cfg.Concurrency,
 		queueCap:     cfg.QueueSize,
 		buildTimeout: cfg.BuildTimeout,
@@ -317,7 +331,31 @@ func (r *Runner) execute(id string) {
 	}
 	_, _ = fmt.Fprintf(&logs, "built %s\n", tag)
 	_ = os.RemoveAll(dir)
-	r.finish(id, store.DeploymentStatusSucceeded, tag, sha, "")
+	if r.releaser == nil {
+		r.finish(id, store.DeploymentStatusSucceeded, tag, sha, "")
+		return
+	}
+	starting := store.DeploymentStatusStarting
+	if _, err := r.store.UpdateDeployment(context.Background(), id, store.DeploymentUpdate{
+		Status:    &starting,
+		ImageTag:  &tag,
+		CommitSHA: &sha,
+	}); err != nil {
+		r.log.Error("mark starting", "deployment", id, "err", err)
+		r.finish(id, store.DeploymentStatusFailed, tag, sha, msgInternal)
+		return
+	}
+	_, _ = fmt.Fprintf(&logs, "starting %s\n", tag)
+	if err := r.releaser.Release(r.ctx, app.Name, id, tag, &logs); err != nil {
+		_, _ = fmt.Fprintf(&logs, "error: %s\n", err.Error())
+		r.finish(id, store.DeploymentStatusFailed, tag, sha, releaseFailure(r.ctx, err))
+		return
+	}
+	got, err := r.store.GetDeployment(context.Background(), id)
+	if err != nil || got.Status != store.DeploymentStatusRunning {
+		r.log.Error("release did not mark running", "deployment", id, "err", err)
+		r.finish(id, store.DeploymentStatusFailed, tag, sha, msgInternal)
+	}
 }
 
 func imageTag(app, sha string) (string, error) {
@@ -365,6 +403,23 @@ func buildFailure(parent, job context.Context, err error) string {
 		return msgCanceled
 	default:
 		return msgBuildFailed
+	}
+}
+
+func releaseFailure(parent context.Context, err error) string {
+	switch {
+	case errors.Is(parent.Err(), context.Canceled), errors.Is(err, context.Canceled):
+		return msgCanceled
+	case errors.Is(err, runtime.ErrStartTimeout):
+		return runtime.ErrStartTimeout.Error()
+	case errors.Is(err, runtime.ErrHealthTimeout):
+		return runtime.ErrHealthTimeout.Error()
+	case errors.Is(err, runtime.ErrDockerNotFound):
+		return runtime.ErrDockerNotFound.Error()
+	case errors.Is(err, runtime.ErrUnhealthy):
+		return runtime.ErrUnhealthy.Error()
+	default:
+		return msgContainerStart
 	}
 }
 
