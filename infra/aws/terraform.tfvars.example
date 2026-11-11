@@ -1,0 +1,6 @@
+# Copy to terraform.tfvars if you want to override a default.
+# Do not commit terraform.tfvars. The defaults already deploy the hello app.
+
+# aws_region = "us-east-1"
+# app_names  = ["hello"]
+# base_domain = ""

@@ -9,6 +9,16 @@ import (
 	"time"
 )
 
+// PassChecker reports healthy without an HTTP call.
+// The ECS runtime waits for the load balancer target inside Start, so the
+// supervisor does not probe the public URL a second time.
+type PassChecker struct{}
+
+// Wait implements Checker.
+func (PassChecker) Wait(context.Context, string) error {
+	return nil
+}
+
 // HTTPChecker polls an HTTP path until it returns a 2xx status or ctx ends.
 // A nil Client uses a short timeout and does not follow redirects.
 type HTTPChecker struct {

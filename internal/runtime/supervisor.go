@@ -52,9 +52,12 @@ type SupervisorConfig struct {
 	CPUMilli      int
 	Network       string
 	HealthTimeout time.Duration
-	PublicURL     func(app string) string
-	Logger        *slog.Logger
-	Now           func() time.Time
+	// StartTimeout bounds Runtime.Start. Zero uses 60s, which fits a local
+	// container. ECS sets a longer timeout because Fargate startup is slower.
+	StartTimeout time.Duration
+	PublicURL    func(app string) string
+	Logger       *slog.Logger
+	Now          func() time.Time
 }
 
 // NewSupervisor returns a supervisor that has not started any containers.
@@ -74,6 +77,10 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 	if cfg.HealthTimeout <= 0 {
 		cfg.HealthTimeout = defaultHealthTimeout
 	}
+	startTimeout := defaultStartTimeout
+	if cfg.StartTimeout > 0 {
+		startTimeout = cfg.StartTimeout
+	}
 	if cfg.Logger == nil {
 		cfg.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
@@ -90,7 +97,7 @@ func NewSupervisor(cfg SupervisorConfig) (*Supervisor, error) {
 		cpu:           cfg.CPUMilli,
 		network:       cfg.Network,
 		healthTimeout: cfg.HealthTimeout,
-		startTimeout:  defaultStartTimeout,
+		startTimeout:  startTimeout,
 		publicURL:     cfg.PublicURL,
 		log:           cfg.Logger,
 		now:           cfg.Now,

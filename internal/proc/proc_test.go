@@ -1,8 +1,10 @@
 package proc
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -27,5 +29,20 @@ func TestRunCancelsProcessGroup(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("sleep was not killed after cancel")
+	}
+}
+
+func TestRunPassesStdin(t *testing.T) {
+	t.Parallel()
+	var stdout bytes.Buffer
+	err := Run(context.Background(), "cat", nil, Spec{
+		Stdin:  strings.NewReader("hello"),
+		Stdout: &stdout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "hello" {
+		t.Fatalf("stdout %q", stdout.String())
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -66,6 +67,18 @@ func run(args []string, stdout, stderr io.Writer) int {
 	network := fs.String("runtime-network", flagDefaults.RuntimeNetwork, "docker network for app containers; empty publishes on 127.0.0.1 (env "+config.EnvRuntimeNetwork+")")
 	dbPath := fs.String("db", flagDefaults.DBPath, "sqlite database file, or memory (env "+config.EnvDB+")")
 	releaseHistory := fs.Int("release-history", flagDefaults.ReleaseHistory, "successful images kept per app (env "+config.EnvReleaseHistory+")")
+	runtimeName := fs.String("runtime", flagDefaults.Runtime, "docker or ecs (env "+config.EnvRuntime+")")
+	awsRegion := fs.String("aws-region", flagDefaults.AWSRegion, "AWS region for the ecs runtime (env "+config.EnvAWSRegion+")")
+	ecsCluster := fs.String("ecs-cluster", flagDefaults.ECSCluster, "ECS cluster name (env "+config.EnvECSCluster+")")
+	ecrRepository := fs.String("ecr-repository", flagDefaults.ECRRepository, "ECR repository URL without a scheme (env "+config.EnvECRRepository+")")
+	executionRole := fs.String("ecs-execution-role-arn", flagDefaults.ECSExecutionRoleARN, "Fargate execution role ARN (env "+config.EnvECSExecutionRoleARN+")")
+	taskRole := fs.String("ecs-task-role-arn", flagDefaults.ECSTaskRoleARN, "Fargate task role ARN (env "+config.EnvECSTaskRoleARN+")")
+	ecsSubnets := fs.String("ecs-subnets", strings.Join(flagDefaults.ECSSubnets, ","), "comma-separated public subnet ids (env "+config.EnvECSSubnets+")")
+	ecsSecurityGroups := fs.String("ecs-security-groups", strings.Join(flagDefaults.ECSSecurityGroups, ","), "comma-separated task security group ids (env "+config.EnvECSSecurityGroups+")")
+	ecsLogGroup := fs.String("ecs-log-group", flagDefaults.ECSLogGroup, "CloudWatch log group (env "+config.EnvECSLogGroup+")")
+	albDNS := fs.String("alb-dns-name", flagDefaults.ALBDNSName, "ALB DNS name without a scheme (env "+config.EnvALBDNSName+")")
+	baseDomain := fs.String("base-domain", flagDefaults.BaseDomain, "optional parent domain for host rules (env "+config.EnvBaseDomain+")")
+	ecsDeployTimeout := fs.Duration("ecs-deploy-timeout", flagDefaults.ECSDeployTimeout, "ECS rollout time limit (env "+config.EnvECSDeployTimeout+")")
 	fs.Usage = func() {
 		fprintf(fs.Output(), "Usage: shipyardd [--addr %s] [--proxy-addr %s]\n", config.DefaultAddr, config.DefaultProxyAddr)
 		fs.PrintDefaults()
@@ -86,23 +99,35 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	cfg := config.Config{
-		Addr:             *addr,
-		ProxyAddr:        *proxyAddr,
-		BuildConcurrency: *concurrency,
-		BuildQueueSize:   *queueSize,
-		BuildTimeout:     *buildTimeout,
-		CloneTimeout:     *cloneTimeout,
-		CloneMaxBytes:    *cloneMax,
-		ContainerPort:    *containerPort,
-		MemoryBytes:      *memoryBytes,
-		CPUMilli:         int(math.Round(*cpus * 1000)),
-		HealthPath:       *healthPath,
-		HealthTimeout:    *healthTimeout,
-		HealthInterval:   *healthInterval,
-		RuntimeNetwork:   *network,
-		DBPath:           *dbPath,
-		ReleaseHistory:   *releaseHistory,
-		WebhookSecret:    loaded.WebhookSecret,
+		Addr:                *addr,
+		ProxyAddr:           *proxyAddr,
+		BuildConcurrency:    *concurrency,
+		BuildQueueSize:      *queueSize,
+		BuildTimeout:        *buildTimeout,
+		CloneTimeout:        *cloneTimeout,
+		CloneMaxBytes:       *cloneMax,
+		ContainerPort:       *containerPort,
+		MemoryBytes:         *memoryBytes,
+		CPUMilli:            int(math.Round(*cpus * 1000)),
+		HealthPath:          *healthPath,
+		HealthTimeout:       *healthTimeout,
+		HealthInterval:      *healthInterval,
+		RuntimeNetwork:      *network,
+		DBPath:              *dbPath,
+		ReleaseHistory:      *releaseHistory,
+		WebhookSecret:       loaded.WebhookSecret,
+		Runtime:             strings.TrimSpace(*runtimeName),
+		AWSRegion:           strings.TrimSpace(*awsRegion),
+		ECSCluster:          strings.TrimSpace(*ecsCluster),
+		ECRRepository:       strings.TrimSpace(*ecrRepository),
+		ECSExecutionRoleARN: strings.TrimSpace(*executionRole),
+		ECSTaskRoleARN:      strings.TrimSpace(*taskRole),
+		ECSSubnets:          splitCSV(*ecsSubnets),
+		ECSSecurityGroups:   splitCSV(*ecsSecurityGroups),
+		ECSLogGroup:         strings.TrimSpace(*ecsLogGroup),
+		ALBDNSName:          strings.TrimSpace(*albDNS),
+		BaseDomain:          strings.TrimSpace(*baseDomain),
+		ECSDeployTimeout:    *ecsDeployTimeout,
 	}
 	if err := cfg.Check(); err != nil {
 		fprintf(stderr, "config: %s\n", err)
@@ -115,39 +140,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer closeStore()
-	if err := runtime.ReconcileLocalRuntime(context.Background(), st); err != nil {
-		logger.Error("reconcile", "err", err)
+	routes := route.NewTable()
+	wired, err := wireRuntime(context.Background(), cfg, logger, st, routes)
+	if err != nil {
+		logger.Error("runtime", "err", err)
 		return 1
 	}
-	dockerRT := runtime.NewDocker()
-	reapCtx, reapCancel := context.WithTimeout(context.Background(), 20*time.Second)
-	if err := dockerRT.StopManaged(reapCtx); err != nil && !errors.Is(err, runtime.ErrDockerNotFound) {
-		logger.Error("stop old containers", "err", err)
-	}
-	reapCancel()
-
-	routes := route.NewTable()
 	supervisor, err := runtime.NewSupervisor(runtime.SupervisorConfig{
-		Store:   st,
-		Runtime: dockerRT,
-		Checker: runtime.HTTPChecker{
-			Path:     cfg.HealthPath,
-			Interval: cfg.HealthInterval,
-		},
+		Store:         st,
+		Runtime:       wired.rt,
+		Checker:       wired.checker,
 		Routes:        routes,
 		Port:          cfg.ContainerPort,
 		MemoryBytes:   cfg.MemoryBytes,
 		CPUMilli:      cfg.CPUMilli,
-		Network:       cfg.RuntimeNetwork,
+		Network:       wired.network,
 		HealthTimeout: cfg.HealthTimeout,
-		PublicURL: func(app string) string {
-			appURL, urlErr := proxy.PublicURL(cfg.ProxyAddr, app)
-			if urlErr != nil {
-				return ""
-			}
-			return appURL
-		},
-		Logger: logger,
+		StartTimeout:  wired.startTimeout,
+		PublicURL:     wired.publicURL,
+		Logger:        logger,
 	})
 	if err != nil {
 		logger.Error("runtime", "err", err)
@@ -163,7 +174,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		BuildTimeout:   cfg.BuildTimeout,
 		CloneTimeout:   cfg.CloneTimeout,
 		ReleaseHistory: cfg.ReleaseHistory,
-		Images:         dockerRT,
+		Images:         wired.images,
 		Logger:         logger,
 	})
 	if err != nil {
@@ -203,6 +214,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"proxy_addr", cfg.ProxyAddr,
 			"build_concurrency", cfg.BuildConcurrency,
 			"db", cfg.DBPath,
+			"runtime", cfg.Runtime,
 			"webhook", cfg.WebhookSecret != "",
 		)
 		errCh <- srv.ListenAndServe()

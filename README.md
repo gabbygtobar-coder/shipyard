@@ -6,7 +6,9 @@ Milestone M0 is the control plane skeleton: `shipyardd` is an HTTP API and `ship
 
 Milestone M1 builds a Docker image from a registered repository. It clones the repo, requires a Dockerfile at the repository root, and tags the image `shipyard/<app>:<short-sha>`.
 
-Milestone M2 runs that image and routes traffic to it. After a build succeeds, `shipyardd` starts a container, waits until an HTTP health check passes, and only then marks the deployment `running`. A later healthy deployment takes over with a blue-green swap: traffic moves first, then the previous container stops. A reverse proxy on its own port routes `Host: <app>.localhost` and `/apps/<app>/` to the current container. The route table itself is in memory. AWS is a later milestone.
+Milestone M2 runs that image and routes traffic to it. After a build succeeds, `shipyardd` starts a container, waits until an HTTP health check passes, and only then marks the deployment `running`. A later healthy deployment takes over with a blue-green swap: traffic moves first, then the previous container stops. A reverse proxy on its own port routes `Host: <app>.localhost` and `/apps/<app>/` to the current container. The route table itself is in memory.
+
+Milestone M3 adds the AWS path. `SHIPYARD_RUNTIME=ecs` pushes the image to ECR and runs it as a Fargate service behind the load balancer from `infra/aws`. The deploy waits until a target is healthy, and `shipyard rollback` points the service at the previous task definition. CI checks the Terraform and the Go tests. It does not apply the stack. Applying it is a manual step, written up in [docs/aws-setup.md](docs/aws-setup.md), because it needs an AWS account and it costs money. The estimate is in [docs/cost.md](docs/cost.md).
 
 Milestone M4 is push-to-deploy and rollback, and it lands before M3. GitHub `push` events can queue a build, and `shipyard rollback` redeploys a retained image through the same health-gated swap. Both talk to the runtime only through the existing interfaces, so an ECS runtime can replace the local Docker runtime later without a second webhook or rollback implementation. Apps, deployments, and releases are stored in SQLite and survive a restart.
 
@@ -17,9 +19,9 @@ Milestone M4 is push-to-deploy and rollback, and it lands before M3. GitHub `pus
 | M0 | HTTP API, CLI, and an in-memory app and deployment store |
 | M1 | Build a Docker image from a Git repository |
 | M2 | Run that image locally and route traffic with a reverse proxy |
-| M3 | Push the image to AWS ECR and run it on ECS Fargate, provisioned with Terraform. Not in this tree yet. |
+| M3 | Push the image to ECR and run it on ECS Fargate. Terraform is in `infra/aws`. Apply is manual. See [docs/aws-setup.md](docs/aws-setup.md) and [docs/cost.md](docs/cost.md). |
 | M4 | Push-to-deploy from GitHub, rollback to a retained image, and a SQLite store. Works on the local Docker runtime. |
-| M5 | Health checks, metrics, operator docs, and a cost note for the AWS path |
+| M5 | Health checks, metrics, and operator docs. The AWS cost note is already in [docs/cost.md](docs/cost.md). |
 
 ## Out of scope
 
@@ -91,7 +93,7 @@ Duplicate names return `409`. A valid name that is not registered returns `404`.
 
 Deployment records contain `id`, `app_name`, `ref`, `commit_sha`, `status`, `image_tag`, `url`, `error`, `created_at`, and, once a worker starts, `started_at` and `finished_at`. Status moves through `queued`, `building`, `starting`, and `running`. A build with no runtime still ends at `succeeded`. `failed` means the build or the health gate stopped. `stopped` means a running container was replaced or stopped with `shipyard stop`. `url` is set when the deployment becomes the one receiving traffic. The image tag is `shipyard/<app>:<12 hex chars of the commit>`.
 
-`shipyardd` stores apps, deployments, logs, webhook delivery ids, and releases in SQLite (`shipyard.db`, or `--db` / `SHIPYARD_DB`). `SHIPYARD_DB=memory` keeps the in-memory store used by tests. The distroless image sets `SHIPYARD_DB=memory` because that filesystem is not a place to keep a database. A restart keeps the records. It does not keep the route table or the containers: startup removes containers labeled `shipyard.managed=true`, marks a deployment that was `running` as `stopped`, and marks `queued`, `building`, or `starting` deployments `failed` with `interrupted by restart`. Roll back or deploy again to serve traffic. The webhook secret is stored for signature checks and is never written to the log.
+`shipyardd` stores apps, deployments, logs, webhook delivery ids, and releases in SQLite (`shipyard.db`, or `--db` / `SHIPYARD_DB`). `SHIPYARD_DB=memory` keeps the in-memory store used by tests. The distroless image sets `SHIPYARD_DB=memory` because that filesystem is not a place to keep a database. A restart keeps the records. In local mode it does not keep the route table or the containers: startup removes containers labeled `shipyard.managed=true`, marks a deployment that was `running` as `stopped`, and marks `queued`, `building`, or `starting` deployments `failed` with `interrupted by restart`. Roll back or deploy again to serve traffic. In ECS mode the Fargate task keeps running. Startup only fails the in-progress builds, and `shipyard stop` can still scale the service to zero. The webhook secret is stored for signature checks and is never written to the log.
 
 The M0 store helper `CreateDeployment` can still record a `pending` placeholder. The build pipeline does not use that status.
 
@@ -130,34 +132,56 @@ The build timeout (default 10m) covers the clone and `docker build`. The clone u
 | Database | `--db` | `SHIPYARD_DB` | `shipyard.db`. `memory` uses the in-memory store. |
 | Release history | `--release-history` | `SHIPYARD_RELEASE_HISTORY` | `5` (1–50). Successful images kept per app. |
 | Webhook secret |  | `SHIPYARD_GITHUB_WEBHOOK_SECRET` | empty. Global HMAC secret. A per-app `webhook_secret` wins for that app. The value is not logged and is not a flag, so it does not appear in the process arguments. |
+| Runtime | `--runtime` | `SHIPYARD_RUNTIME` | `docker`. `ecs` pushes to ECR and runs on Fargate. The AWS settings are in [docs/aws-setup.md](docs/aws-setup.md). |
 
 ### Architecture
 
+`SHIPYARD_RUNTIME` selects the diagram. The default is local Docker.
+
+Local mode:
+
+```mermaid
+flowchart TD
+  cli["shipyard CLI"] --> api["shipyardd API :8080"]
+  api --> store["SQLite store"]
+  api --> runner["build runner"]
+  runner --> git["git clone"]
+  runner --> build["docker build"]
+  runner --> supervisor["supervisor"]
+  supervisor --> docker["Docker runtime"]
+  supervisor --> health["HTTP health check"]
+  supervisor --> routes["route table"]
+  proxy["proxy :8081"] --> routes
+  routes --> app["app container"]
 ```
-shipyard CLI
-    |
-    v
-shipyardd API (:8080) --> store (SQLite, or memory in tests)
-    |
-    +--> Runner (bounded worker pool)
-    |       +--> source.Cloner    git fetch --depth 1
-    |       +--> build.Builder    docker build
-    |       +--> runtime.Supervisor
-    |               +--> Runtime        docker run
-    |               +--> health check
-    |               +--> route table
-    |
-    +--> proxy (:8081) --> route table --> current container
+
+AWS mode (`SHIPYARD_RUNTIME=ecs`). `shipyardd` still runs on your machine. Browsers use the load balancer, not the local proxy.
+
+```mermaid
+flowchart TD
+  cli["shipyard CLI"] --> api["shipyardd on your machine"]
+  api --> store["SQLite store"]
+  api --> runner["build runner"]
+  runner --> git["git clone"]
+  runner --> build["docker build"]
+  runner --> ecsrt["ECS runtime"]
+  ecsrt --> ecr["ECR push"]
+  ecsrt --> taskdef["task definition revision"]
+  ecsrt --> service["create or update ECS service"]
+  ecsrt --> wait["wait until the deployment is stable and a target is healthy"]
+  browser["browser"] --> alb["ALB path or host rule"]
+  alb --> task["Fargate task in a public subnet"]
+  ecr --> task
 ```
 
 Clone, image build, and the container runtime sit behind interfaces so tests can replace them:
 
 - `source.Cloner` (`internal/source`). `Git` shells out to `git`. `Fake` writes a fixture tree.
 - `build.Builder` (`internal/build`). `Docker` shells out to `docker build`. `Fake` records the tag and returns a scripted result.
-- `runtime.Runtime` (`internal/runtime`). `Docker` shells out to `docker run`, `docker rm`, `docker inspect`, and `docker logs`. `Fake` records start and stop calls. `HTTPChecker` polls the health path. `FakeChecker` returns a scripted result.
+- `runtime.Runtime` (`internal/runtime`). `Docker` shells out to `docker run`, `docker rm`, `docker inspect`, and `docker logs`. `ecs.Runtime` (`internal/runtime/ecs`) uses aws-sdk-go-v2 behind small interfaces: push to ECR, register a task definition, create or update the service, and wait until the target group is healthy. A deploy of an image that already has a task definition points the service at that revision. `Fake` records start and stop calls. `HTTPChecker` polls the health path for local containers. `PassChecker` is used for ECS because that wait already happened inside `Start`. `FakeChecker` returns a scripted result.
 - `deploy.Runner` (`internal/deploy`) owns the queue, timeouts, status transitions, temp directories, and log capture. With a releaser configured, it hands a built image to the supervisor.
 
-The Docker builder and the runtime call the `docker` CLI instead of the Docker Engine SDK. Current Docker installs build with BuildKit, and `docker build` is that builder. The Engine SDK `ImageBuild` call is the legacy builder; driving BuildKit through the SDK needs a session client and a much larger module graph. Shipyard has no third-party modules. The CLI is the same command a person would run. The context directory, tag, container name, limits, and image are exec arguments.
+The Docker builder and the local runtime call the `docker` CLI instead of the Docker Engine SDK. Current Docker installs build with BuildKit, and `docker build` is that builder. The Engine SDK `ImageBuild` call is the legacy builder; driving BuildKit through the SDK needs a session client and a much larger module graph. The CLI is the same command a person would run. The context directory, tag, container name, limits, and image are exec arguments. The ECS runtime is the exception: it calls AWS through aws-sdk-go-v2. The SQLite store uses `modernc.org/sqlite`. ECR login passes the password on stdin, not as a command argument.
 
 `git` and `docker` run as subprocesses, never through a shell. On Unix each child is its own process group and is killed when the context ends, so a timed-out fetch does not leave `git-remote-https` behind. The git environment drops inherited `GIT_*` variables and disables credential prompts. `docker run -d` returns as soon as the daemon has created the container; the container itself keeps running until Shipyard stops it.
 
@@ -234,7 +258,7 @@ Both are optional. A `curl` with a correctly signed body hits the same endpoint.
 
 ## Rollback
 
-A deployment that reaches `running` (or `succeeded`, when no runtime is configured) is a release. Shipyard keeps the last `--release-history` images per app, default 5. Older images are dropped. On the local runtime the dropped tag is removed with `docker rmi` when nothing retained still uses it. An ECS runtime can implement the same image-removal interface later.
+A deployment that reaches `running` (or `succeeded`, when no runtime is configured) is a release. Shipyard keeps the last `--release-history` images per app, default 5. Older images are dropped. On the local runtime the dropped tag is removed with `docker rmi` when nothing retained still uses it. On ECS the matching ECR tag is deleted. The repository lifecycle policy also keeps the last 5 images.
 
 `shipyard rollback` does not clone or build. It starts the retained image and waits for the same health gate. Traffic moves only after that check passes. If the new container fails the health check, the previous container keeps serving.
 
@@ -305,7 +329,7 @@ make test-integration   # needs Docker; builds, runs, and proxies examples/hello
 curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v1.61.0/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v1.61.0
 ```
 
-GitHub Actions runs vet, golangci-lint, `go test -race` with coverage, the integration test against [`examples/hello`](examples/hello), and `docker build` of the distroless `shipyardd` image. The integration test builds `examples/hello` twice with `VERSION=v1` and `VERSION=v2`, serves v2, rolls back to the v1 image, checks that the proxy body contains `version v1`, and removes the containers and images.
+GitHub Actions runs vet, golangci-lint, `go test -race` with coverage, the integration test against [`examples/hello`](examples/hello), `docker build` of the distroless `shipyardd` image, and a Terraform job. The Terraform job runs `fmt -check`, `init -backend=false`, `validate`, and `tflint`. It has no AWS credentials and does not apply. The integration test builds `examples/hello` twice with `VERSION=v1` and `VERSION=v2`, serves v2, rolls back to the v1 image, checks that the proxy body contains `version v1`, and removes the containers and images.
 
 ## Layout
 
@@ -316,6 +340,10 @@ GitHub Actions runs vet, golangci-lint, `go test -race` with coverage, the integ
 - `internal/source` — `Cloner` interface, `git` implementation, and test fake
 - `internal/build` — `Builder` interface, `docker build` implementation, and test fake
 - `internal/runtime` — `Runtime` and health-check interfaces, Docker implementation, fakes, and the blue-green supervisor
+- `internal/runtime/ecs` — ECS Fargate runtime. AWS calls sit behind interfaces and the tests use fakes
+- `infra/aws` — Terraform for the VPC, ECR, ECS, IAM, logs, and the load balancer. `make aws-up` / `make aws-down`
+- `docs/aws-setup.md` — account, MFA, IAM, budget, apply, deploy, and teardown
+- `docs/cost.md` — monthly cost estimate. The load balancer is the main cost
 - `internal/proxy` — reverse proxy and public URL
 - `internal/route` — in-memory table of the container currently serving each app
 - `internal/store` — `Store` interface, the in-memory store, SQLite, and migrations
