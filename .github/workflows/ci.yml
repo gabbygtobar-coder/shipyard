@@ -38,6 +38,9 @@ jobs:
       - name: Coverage
         run: go tool cover -func=coverage.out
 
+      - name: Integration test
+        run: SHIPYARD_INTEGRATION=1 go test -race -count=1 -timeout 15m -run TestIntegrationHello ./internal/build/
+
   docker:
     name: docker
     runs-on: ubuntu-latest

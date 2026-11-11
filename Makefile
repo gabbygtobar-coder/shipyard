@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR := bin
 export PATH := $(shell $(GO) env GOPATH)/bin:$(PATH)
 
-.PHONY: build test lint run clean cover docker
+.PHONY: build test test-integration lint run clean cover docker
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -11,6 +11,9 @@ build:
 
 test:
 	$(GO) test -race -count=1 -coverprofile=coverage.out -covermode=atomic ./...
+
+test-integration:
+	SHIPYARD_INTEGRATION=1 $(GO) test -race -count=1 -timeout 15m -run TestIntegrationHello ./internal/build/
 
 cover: test
 	$(GO) tool cover -func=coverage.out

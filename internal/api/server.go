@@ -1,4 +1,4 @@
-// Package api implements the M0 shipyard HTTP API.
+// Package api implements the shipyard HTTP API.
 package api
 
 import (
@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"time"
 
+	"github.com/gabbygtobar-coder/shipyard/internal/deploy"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
 
@@ -26,26 +27,37 @@ const (
 	errBodyTooLarge = "request body too large"
 	errContentType  = "content type must be application/json"
 	errCanceled     = "request canceled"
+
+	errDeploymentNotFound = "deployment not found"
+	errInvalidDeployment  = "invalid deployment"
+	errBuildsUnconfigured = "builds are not configured"
 )
 
-// handler serves the M0 HTTP API.
+// handler serves the shipyard HTTP API.
 type handler struct {
-	store store.Store
-	log   *slog.Logger
+	store  store.Store
+	builds deploy.BuildService
+	log    *slog.Logger
 }
 
 // NewHandler returns the shipyard HTTP API.
-// st must be non-nil. A nil logger discards log output.
-func NewHandler(st store.Store, logger *slog.Logger) http.Handler {
+// st must be non-nil. builds may be nil, in which case deployment creation
+// returns 503 and the read routes still serve records already in st.
+// A nil logger discards log output.
+func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	h := &handler{store: st, log: logger}
+	h := &handler{store: st, builds: builds, log: logger}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("POST /apps", h.createApp)
 	mux.HandleFunc("GET /apps", h.listApps)
 	mux.HandleFunc("GET /apps/{name}", h.getApp)
+	mux.HandleFunc("POST /apps/{name}/deployments", h.createDeployment)
+	mux.HandleFunc("GET /apps/{name}/deployments", h.listDeployments)
+	mux.HandleFunc("GET /deployments/{id}", h.getDeployment)
+	mux.HandleFunc("GET /deployments/{id}/logs", h.deploymentLogs)
 	return h.wrap(mux)
 }
 
@@ -104,6 +116,16 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 		s.wrote = true
 	}
 	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusRecorder) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
 }
 
 type errorBody struct {
