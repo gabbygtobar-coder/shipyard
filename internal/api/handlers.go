@@ -59,7 +59,7 @@ func (h *handler) createApp(w http.ResponseWriter, r *http.Request) {
 
 	app, err := h.store.CreateApp(r.Context(), name, repoURL)
 	if err != nil {
-		h.writeStoreError(w, err)
+		h.writeStoreError(w, err, errAppNotFound)
 		return
 	}
 	w.Header().Set("Location", "/apps/"+url.PathEscape(name))
@@ -69,7 +69,7 @@ func (h *handler) createApp(w http.ResponseWriter, r *http.Request) {
 func (h *handler) listApps(w http.ResponseWriter, r *http.Request) {
 	apps, err := h.store.ListApps(r.Context())
 	if err != nil {
-		h.writeStoreError(w, err)
+		h.writeStoreError(w, err, errAppNotFound)
 		return
 	}
 	if apps == nil {
@@ -86,18 +86,18 @@ func (h *handler) getApp(w http.ResponseWriter, r *http.Request) {
 	}
 	app, err := h.store.GetApp(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err)
+		h.writeStoreError(w, err, errAppNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, app)
 }
 
-func (h *handler) writeStoreError(w http.ResponseWriter, err error) {
+func (h *handler) writeStoreError(w http.ResponseWriter, err error, notFound string) {
 	switch {
 	case errors.Is(err, store.ErrAlreadyExists):
 		writeError(w, http.StatusConflict, errAppExists)
 	case errors.Is(err, store.ErrNotFound):
-		writeError(w, http.StatusNotFound, errAppNotFound)
+		writeError(w, http.StatusNotFound, notFound)
 	case errors.Is(err, store.ErrInvalid):
 		writeError(w, http.StatusBadRequest, errInvalidApp)
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):

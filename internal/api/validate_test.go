@@ -40,6 +40,21 @@ func TestValidateName(t *testing.T) {
 	}
 }
 
+func TestValidateDeploymentID(t *testing.T) {
+	t.Parallel()
+	if err := ValidateDeploymentID("dep_1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateDeploymentID("dep_42"); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{"", "dep_", "dep_0", "dep_01", "dep_1a", "../dep_1"} {
+		if err := ValidateDeploymentID(id); !errors.Is(err, ErrDeploymentID) {
+			t.Fatalf("ValidateDeploymentID(%q) = %v", id, err)
+		}
+	}
+}
+
 func TestNormalizeRepoURL(t *testing.T) {
 	t.Parallel()
 	owner39 := "a" + strings.Repeat("b", 38)

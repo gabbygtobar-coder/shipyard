@@ -9,12 +9,9 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
-
-const clientTimeout = 20 * time.Second
 
 type apiClient struct {
 	baseURL string
@@ -34,10 +31,14 @@ type appListResponse struct {
 	Apps []store.App `json:"apps"`
 }
 
+type deploymentListResponse struct {
+	Deployments []store.Deployment `json:"deployments"`
+}
+
 func newAPIClient(baseURL string) *apiClient {
 	return &apiClient{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		http:    &http.Client{Timeout: clientTimeout},
+		http:    &http.Client{},
 	}
 }
 
@@ -59,6 +60,63 @@ func (c *apiClient) listApps(ctx context.Context) (appListResponse, error) {
 		out.Apps = []store.App{}
 	}
 	return out, nil
+}
+
+func (c *apiClient) deploy(ctx context.Context, name, ref string) (store.Deployment, error) {
+	var dep store.Deployment
+	body := map[string]string{"ref": ref}
+	path := "/apps/" + url.PathEscape(name) + "/deployments"
+	if err := c.do(ctx, http.MethodPost, path, body, &dep); err != nil {
+		return store.Deployment{}, err
+	}
+	return dep, nil
+}
+
+func (c *apiClient) listDeployments(ctx context.Context, name string) (deploymentListResponse, error) {
+	var out deploymentListResponse
+	path := "/apps/" + url.PathEscape(name) + "/deployments"
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return deploymentListResponse{}, err
+	}
+	if out.Deployments == nil {
+		out.Deployments = []store.Deployment{}
+	}
+	return out, nil
+}
+
+func (c *apiClient) getDeployment(ctx context.Context, id string) (store.Deployment, error) {
+	var dep store.Deployment
+	path := "/deployments/" + url.PathEscape(id)
+	if err := c.do(ctx, http.MethodGet, path, nil, &dep); err != nil {
+		return store.Deployment{}, err
+	}
+	return dep, nil
+}
+
+func (c *apiClient) streamLogs(ctx context.Context, id string, follow bool, dst io.Writer) error {
+	path := "/deployments/" + url.PathEscape(id) + "/logs"
+	if follow {
+		path += "?follow=1"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	limit := int64(store.MaxDeploymentLogBytes + 4096)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		if readErr != nil {
+			return readErr
+		}
+		return &apiError{Status: resp.StatusCode, Message: apiErrorMessage(resp.Status, data)}
+	}
+	_, err = io.Copy(dst, io.LimitReader(resp.Body, limit))
+	return err
 }
 
 func (c *apiClient) getApp(ctx context.Context, name string) (store.App, error) {

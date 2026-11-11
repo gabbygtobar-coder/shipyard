@@ -14,7 +14,10 @@ import (
 	"time"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/api"
+	"github.com/gabbygtobar-coder/shipyard/internal/build"
 	"github.com/gabbygtobar-coder/shipyard/internal/config"
+	"github.com/gabbygtobar-coder/shipyard/internal/deploy"
+	"github.com/gabbygtobar-coder/shipyard/internal/source"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
 
@@ -24,7 +27,21 @@ func testAPI(t *testing.T) *httptest.Server {
 		return time.Date(2026, 11, 11, 3, 4, 5, 0, time.UTC)
 	})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	srv := httptest.NewServer(api.NewHandler(st, logger))
+	runner, err := deploy.New(deploy.Config{
+		Store:        st,
+		Cloner:       &source.Fake{Files: map[string]string{"Dockerfile": "FROM scratch\n"}},
+		Builder:      &build.Fake{Log: "built\n"},
+		BuildTimeout: 5 * time.Second,
+		CloneTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runner.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(runner.Stop)
+	srv := httptest.NewServer(api.NewHandler(st, runner, logger))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -126,7 +143,13 @@ func TestCLIUsage(t *testing.T) {
 	}{
 		{name: "no args", args: nil, want: 2},
 		{name: "help", args: []string{"-h"}, want: 0},
-		{name: "unknown", args: []string{"deploy"}, want: 2},
+		{name: "unknown", args: []string{"reboot"}, want: 2},
+		{name: "deploy missing", args: []string{"deploy"}, want: 2},
+		{name: "deploy help", args: []string{"deploy", "-h"}, want: 0},
+		{name: "deploy extra", args: []string{"deploy", "demo", "extra"}, want: 2},
+		{name: "deployments missing", args: []string{"deployments"}, want: 2},
+		{name: "logs missing", args: []string{"logs"}, want: 2},
+		{name: "logs help", args: []string{"logs", "-h"}, want: 0},
 		{name: "apps only", args: []string{"apps"}, want: 2},
 		{name: "unknown apps", args: []string{"apps", "delete"}, want: 2},
 		{name: "create help", args: []string{"apps", "create", "-h"}, want: 0},
@@ -161,6 +184,52 @@ func TestCLIServerError(t *testing.T) {
 	code, _, stderr = runCLI(t, []string{"--api-url", srv.URL, "apps", "get", "missing"}, getenv)
 	if code != 1 || !strings.Contains(stderr, "app not found") || !strings.Contains(stderr, "HTTP 404") {
 		t.Fatalf("code %d stderr %s", code, stderr)
+	}
+}
+
+func TestCLIDeployListAndLogs(t *testing.T) {
+	t.Parallel()
+	srv := testAPI(t)
+	getenv := func(string) string { return "" }
+	code, _, stderr := runCLI(t, []string{"--api-url", srv.URL, "apps", "create", "--name", "demo", "--repo", "https://github.com/acme/demo"}, getenv)
+	if code != 0 {
+		t.Fatalf("create code %d stderr %s", code, stderr)
+	}
+	code, stdout, stderr := runCLI(t, []string{"--api-url", srv.URL, "deploy", "demo", "--ref", "main"}, getenv)
+	if code != 0 {
+		t.Fatalf("deploy code %d stderr %s", code, stderr)
+	}
+	var dep store.Deployment
+	if err := json.Unmarshal([]byte(stdout), &dep); err != nil {
+		t.Fatalf("stdout %s: %v", stdout, err)
+	}
+	if dep.ID != "dep_1" || dep.Status != store.DeploymentStatusQueued || dep.Ref != "main" {
+		t.Fatalf("deploy = %#v", dep)
+	}
+
+	code, stdout, stderr = runCLI(t, []string{"--api-url", srv.URL, "deployments", "list", "demo"}, getenv)
+	if code != 0 {
+		t.Fatalf("list code %d stderr %s", code, stderr)
+	}
+	var list deploymentListResponse
+	if err := json.Unmarshal([]byte(stdout), &list); err != nil {
+		t.Fatal(err)
+	}
+	if len(list.Deployments) != 1 || list.Deployments[0].ID != "dep_1" {
+		t.Fatalf("list %#v", list)
+	}
+
+	code, stdout, stderr = runCLI(t, []string{"--api-url", srv.URL, "logs", dep.ID, "--follow"}, getenv)
+	if code != 0 {
+		t.Fatalf("logs code %d stderr %s stdout %s", code, stderr, stdout)
+	}
+	if !strings.Contains(stdout, "built") || !strings.Contains(stdout, "shipyard/demo:0123456789ab") {
+		t.Fatalf("logs stdout %s", stdout)
+	}
+
+	code, _, stderr = runCLI(t, []string{"--api-url", srv.URL, "logs", "dep_9"}, getenv)
+	if code != 1 || !strings.Contains(stderr, "deployment not found") {
+		t.Fatalf("missing logs code %d stderr %s", code, stderr)
 	}
 }
 

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -283,6 +284,21 @@ func TestMemoryContextCanceled(t *testing.T) {
 	if _, err := st.ListDeployments(ctx, "demo"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ListDeployments error = %v", err)
 	}
+	if _, err := st.CreateBuild(ctx, "demo", "main"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CreateBuild error = %v", err)
+	}
+	if _, err := st.UpdateDeployment(ctx, "dep_1", DeploymentUpdate{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("UpdateDeployment error = %v", err)
+	}
+	if err := st.AppendDeploymentLog(ctx, "dep_1", []byte("x")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AppendDeploymentLog error = %v", err)
+	}
+	if _, err := st.ReadDeploymentLog(ctx, "dep_1", 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadDeploymentLog error = %v", err)
+	}
+	if err := st.WaitDeploymentLog(ctx, "dep_1", 0); !errors.Is(err, context.Canceled) {
+		t.Fatalf("WaitDeploymentLog error = %v", err)
+	}
 }
 
 func TestMemoryNilClock(t *testing.T) {
@@ -297,6 +313,209 @@ func TestMemoryNilClock(t *testing.T) {
 		t.Fatalf("CreatedAt = %s", app.CreatedAt)
 	}
 }
+
+func TestMemoryBuildLifecycle(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 11, 11, 3, 4, 5, 0, time.UTC)
+	st := NewMemoryWithClock(func() time.Time { return now })
+	ctx := context.Background()
+	if _, err := st.CreateApp(ctx, "demo", "https://github.com/acme/demo"); err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateBuild(ctx, " demo ", " feature/one ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dep.ID != "dep_1" || dep.Status != DeploymentStatusQueued || dep.Ref != "feature/one" || dep.AppName != "demo" {
+		t.Fatalf("build = %#v", dep)
+	}
+	if !dep.CreatedAt.Equal(now) || dep.StartedAt != nil || dep.FinishedAt != nil {
+		t.Fatalf("timestamps = %#v", dep)
+	}
+
+	if _, err := st.CreateBuild(ctx, "demo", "--evil"); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("bad ref error = %v", err)
+	}
+	if _, err := st.CreateBuild(ctx, "missing", "main"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing app error = %v", err)
+	}
+	next, err := st.CreateBuild(ctx, "demo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ID != "dep_2" || next.Ref != "" {
+		t.Fatalf("second = %#v", next)
+	}
+
+	building := DeploymentStatusBuilding
+	started := now.Add(time.Minute)
+	updated, err := st.UpdateDeployment(ctx, "dep_1", DeploymentUpdate{Status: &building, StartedAt: &started})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != DeploymentStatusBuilding || updated.StartedAt == nil || !updated.StartedAt.Equal(started) {
+		t.Fatalf("building = %#v", updated)
+	}
+	started = started.Add(time.Hour)
+	got, err := st.GetDeployment(ctx, "dep_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.StartedAt == nil || !got.StartedAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("stored start changed to %v", got.StartedAt)
+	}
+
+	if err := st.AppendDeploymentLog(ctx, "dep_1", []byte("alpha")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.AppendDeploymentLog(ctx, "dep_1", []byte("beta")); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := st.ReadDeploymentLog(ctx, "dep_1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(snap.Data) != "alphabeta" || snap.Terminal || snap.Next != len("alphabeta") {
+		t.Fatalf("log = %#v", snap)
+	}
+	part, err := st.ReadDeploymentLog(ctx, "dep_1", 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(part.Data) != "beta" {
+		t.Fatalf("partial = %q", part.Data)
+	}
+
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	tag := "shipyard/demo:0123456789ab"
+	okStatus := DeploymentStatusSucceeded
+	finished := now.Add(2 * time.Minute)
+	done, err := st.UpdateDeployment(ctx, "dep_1", DeploymentUpdate{
+		Status:     &okStatus,
+		CommitSHA:  &sha,
+		ImageTag:   &tag,
+		FinishedAt: &finished,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if done.CommitSHA != sha || done.ImageTag != tag || done.FinishedAt == nil || !done.FinishedAt.Equal(finished) {
+		t.Fatalf("done = %#v", done)
+	}
+	if _, err := st.UpdateDeployment(ctx, "dep_1", DeploymentUpdate{Error: strPtr("later")}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("terminal update error = %v", err)
+	}
+	if err := st.AppendDeploymentLog(ctx, "dep_1", []byte("!")); err != nil {
+		t.Fatal(err)
+	}
+	snap, err = st.ReadDeploymentLog(ctx, "dep_1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(snap.Data) != "alphabeta!" || !snap.Terminal {
+		t.Fatalf("final log = %#v", snap)
+	}
+}
+
+func TestMemoryDeploymentTransitions(t *testing.T) {
+	t.Parallel()
+	st := NewMemory()
+	ctx := context.Background()
+	if _, err := st.CreateApp(ctx, "demo", "https://github.com/acme/demo"); err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateBuild(ctx, "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	illegal := []string{DeploymentStatusSucceeded, DeploymentStatusPending, "nope"}
+	for _, status := range illegal {
+		status := status
+		_, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &status})
+		if !errors.Is(err, ErrInvalid) {
+			t.Fatalf("queued -> %s error = %v", status, err)
+		}
+	}
+	building := DeploymentStatusBuilding
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &building}); err != nil {
+		t.Fatal(err)
+	}
+	back := DeploymentStatusQueued
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &back}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("building -> queued error = %v", err)
+	}
+	failed := DeploymentStatusFailed
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &failed, Error: strPtr("boom")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &building}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("failed -> building error = %v", err)
+	}
+	got, err := st.GetDeployment(ctx, dep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != DeploymentStatusFailed || got.Error != "boom" {
+		t.Fatalf("got = %#v", got)
+	}
+}
+
+func TestMemoryLogTruncationAndWait(t *testing.T) {
+	t.Parallel()
+	st := NewMemory()
+	ctx := context.Background()
+	if _, err := st.CreateApp(ctx, "demo", "https://github.com/acme/demo"); err != nil {
+		t.Fatal(err)
+	}
+	dep, err := st.CreateBuild(ctx, "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := bytes.Repeat([]byte("a"), MaxDeploymentLogBytes+32)
+	if err := st.AppendDeploymentLog(ctx, dep.ID, payload); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := st.ReadDeploymentLog(ctx, dep.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(snap.Data, []byte("[log truncated]")) {
+		t.Fatal("expected truncation notice")
+	}
+	if err := st.AppendDeploymentLog(ctx, dep.ID, []byte("more")); err != nil {
+		t.Fatal(err)
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- st.WaitDeploymentLog(waitCtx, dep.ID, len(snap.Data))
+	}()
+	time.Sleep(40 * time.Millisecond)
+	failed := DeploymentStatusFailed
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &failed}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("wait did not notice the terminal status")
+	}
+
+	if _, err := st.ReadDeploymentLog(ctx, dep.ID, -1); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("negative offset error = %v", err)
+	}
+	if _, err := st.ReadDeploymentLog(ctx, "missing", 0); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing log error = %v", err)
+	}
+}
+
+func strPtr(s string) *string { return &s }
 
 func TestMemoryConcurrentCreates(t *testing.T) {
 	t.Parallel()
