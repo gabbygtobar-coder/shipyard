@@ -17,8 +17,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gabbygtobar-coder/shipyard/internal/requestid"
 	"github.com/gabbygtobar-coder/shipyard/internal/route"
 )
+
+// Observer records proxy traffic. Nil skips recording.
+type Observer interface {
+	ObserveProxy(app string, status int, latency time.Duration)
+}
 
 const (
 	msgNoApp      = "no application in request\n"
@@ -41,6 +47,7 @@ type Handler struct {
 	routes *route.Table
 	proxy  *httputil.ReverseProxy
 	log    *slog.Logger
+	obs    Observer
 }
 
 // New returns a proxy that reads targets from routes.
@@ -61,26 +68,43 @@ func New(routes *route.Table, logger *slog.Logger) *Handler {
 	return h
 }
 
+// SetObserver records request counts and latency. A nil observer disables that.
+func (h *Handler) SetObserver(obs Observer) {
+	if h == nil {
+		return
+	}
+	h.obs = obs
+}
+
 // ServeHTTP routes by Host `<app>.localhost` or by the path `/apps/<app>/`.
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
+	id := requestid.FromRequest(r)
+	logger := requestid.Logger(h.log, id)
+	ctx := requestid.With(r.Context(), id)
+	r = r.WithContext(ctx)
+	w.Header().Set(requestid.Header, id)
 	sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 	app := ""
 	defer func() {
 		rec := recover()
 		if rec != nil {
-			h.log.Error("proxy panic", "err", fmt.Sprint(rec), "stack", string(debug.Stack()))
+			logger.Error("proxy panic", "err", fmt.Sprint(rec), "stack", string(debug.Stack()))
 			if !sw.wrote {
 				http.Error(sw, "internal error\n", http.StatusInternalServerError)
 			}
 		}
-		h.log.Info("proxy",
+		latency := time.Since(start)
+		logger.Info("proxy",
 			"app", app,
 			"method", r.Method,
 			"path", r.URL.Path,
 			"status", sw.status,
-			"latency_ms", time.Since(start).Milliseconds(),
+			"latency_ms", latency.Milliseconds(),
 		)
+		if h.obs != nil {
+			h.obs.ObserveProxy(app, sw.status, latency)
+		}
 	}()
 
 	upstream := r.URL.Path
@@ -110,7 +134,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(sw, fmt.Sprintf(msgBadGateway, app), http.StatusBadGateway)
 		return
 	}
-	ctx := context.WithValue(r.Context(), ctxApp, app)
+	ctx = context.WithValue(r.Context(), ctxApp, app)
 	ctx = context.WithValue(ctx, ctxPath, upstream)
 	ctx = context.WithValue(ctx, targetKey{}, parsed)
 	h.proxy.ServeHTTP(sw, r.WithContext(ctx))
@@ -131,11 +155,14 @@ func (h *Handler) rewrite(pr *httputil.ProxyRequest) {
 	pr.Out.URL.Path = path
 	pr.Out.URL.RawPath = ""
 	pr.Out.Host = target.Host
+	if id := requestid.From(pr.In.Context()); id != "" {
+		pr.Out.Header.Set(requestid.Header, id)
+	}
 }
 
 func (h *Handler) proxyError(w http.ResponseWriter, r *http.Request, err error) {
 	app, _ := r.Context().Value(ctxApp).(string)
-	h.log.Error("proxy upstream", "app", app, "err", err)
+	requestid.Logger(h.log, requestid.From(r.Context())).Error("proxy upstream", "app", app, "err", err)
 	http.Error(w, fmt.Sprintf(msgBadGateway, app), http.StatusBadGateway)
 }
 

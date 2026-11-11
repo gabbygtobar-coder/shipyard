@@ -2,7 +2,7 @@ GO ?= go
 BIN_DIR := bin
 export PATH := $(shell $(GO) env GOPATH)/bin:$(PATH)
 
-.PHONY: build test test-integration lint run compose clean cover docker aws-up aws-down
+.PHONY: build test test-integration lint run compose compose-obs clean cover docker aws-up aws-down
 
 TF_DIR := infra/aws
 
@@ -19,6 +19,9 @@ test-integration:
 
 compose:
 	docker compose up --build
+
+compose-obs:
+	docker compose --profile observability up --build
 
 cover: test
 	$(GO) tool cover -func=coverage.out

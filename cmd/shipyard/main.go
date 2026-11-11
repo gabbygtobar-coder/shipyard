@@ -31,6 +31,7 @@ Usage:
   shipyard [--api-url URL] releases APP
   shipyard [--api-url URL] rollback APP [--to DEPLOYMENT_ID]
   shipyard [--api-url URL] logs DEPLOYMENT_ID [--follow]
+  shipyard [--api-url URL] events APP
   shipyard [--api-url URL] stop APP
 
 The API base URL is taken from --api-url, then SHIPYARD_API_URL,
@@ -38,6 +39,7 @@ then http://127.0.0.1:8080. An empty --ref builds the repository default branch.
 logs --follow streams until the build finishes and exits 1 when it fails.
 apps url prints the public URL. stop ends the container that is receiving traffic.
 rollback redeploys a retained image. releases lists the images kept for rollback.
+events prints the append-only timeline for one app, newest first.
 
 `
 )
@@ -92,6 +94,8 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return runRollback(rest[1:], client, stdout, stderr)
 	case "releases":
 		return runReleases(rest[1:], client, stdout, stderr)
+	case "events":
+		return runEvents(rest[1:], client, stdout, stderr)
 	default:
 		fprintf(stderr, "unknown command %q\n\n", rest[0])
 		fs.Usage()
@@ -364,6 +368,39 @@ func runReleases(args []string, client *apiClient, stdout, stderr io.Writer) int
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	list, err := client.releases(ctx, app)
+	if err != nil {
+		return writeCLIError(stderr, err)
+	}
+	return writeJSON(stdout, stderr, list)
+}
+
+func runEvents(args []string, client *apiClient, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("events", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fprintln(fs.Output(), "usage: shipyard events APP")
+	}
+	app, flagArgs := splitLeadingArg(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if app == "" && fs.NArg() == 1 {
+		app = fs.Arg(0)
+	} else if app != "" && fs.NArg() != 0 {
+		fs.Usage()
+		return 2
+	}
+	app = strings.TrimSpace(app)
+	if app == "" {
+		fs.Usage()
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	list, err := client.events(ctx, app)
 	if err != nil {
 		return writeCLIError(stderr, err)
 	}

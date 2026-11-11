@@ -1,0 +1,76 @@
+{
+  "annotations": { "list": [] },
+  "editable": false,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] },
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "textMode": "auto" },
+      "targets": [{ "expr": "shipyard_active_deployments", "refId": "A" }],
+      "title": "Active deployments",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "id": 2,
+      "targets": [
+        { "expr": "sum by (status) (rate(shipyard_builds_total[5m]))", "legendFormat": "build {{status}}", "refId": "A" },
+        { "expr": "sum by (status) (rate(shipyard_deploys_total[5m]))", "legendFormat": "deploy {{status}}", "refId": "B" }
+      ],
+      "title": "Builds and deploys",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, status) (rate(shipyard_build_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{status}}", "refId": "A" }],
+      "title": "Build duration p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "targets": [{ "expr": "sum by (app, status) (rate(shipyard_proxy_requests_total[5m]))", "legendFormat": "{{app}} {{status}}", "refId": "A" }],
+      "title": "Proxy requests",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "id": 5,
+      "targets": [{ "expr": "histogram_quantile(0.95, sum by (le, app, status) (rate(shipyard_proxy_request_duration_seconds_bucket[5m])))", "legendFormat": "{{app}} {{status}}", "refId": "A" }],
+      "title": "Proxy latency p95",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "id": 6,
+      "targets": [{ "expr": "sum by (result) (rate(shipyard_webhook_deliveries_total[5m]))", "legendFormat": "{{result}}", "refId": "A" }],
+      "title": "Webhook deliveries",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 39,
+  "tags": ["shipyard"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "utc",
+  "title": "Shipyard",
+  "uid": "shipyard",
+  "version": 1
+}

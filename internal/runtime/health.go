@@ -69,6 +69,31 @@ func (c HTTPChecker) Wait(ctx context.Context, endpoint string) error {
 }
 
 func (c HTTPChecker) probe(ctx context.Context, client *http.Client, target string) error {
+	return probeOnce(ctx, client, target)
+}
+
+// ProbeOnce performs one health GET. A 2xx response is healthy.
+// A nil client uses a two-second timeout and does not follow redirects.
+func ProbeOnce(ctx context.Context, endpoint, path string, client *http.Client) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	target, err := healthURL(endpoint, path)
+	if err != nil {
+		return err
+	}
+	if client == nil {
+		client = &http.Client{
+			Timeout: 2 * time.Second,
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		}
+	}
+	return probeOnce(ctx, client, target)
+}
+
+func probeOnce(ctx context.Context, client *http.Client, target string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 	if err != nil {
 		return err

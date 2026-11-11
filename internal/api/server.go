@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/deploy"
+	"github.com/gabbygtobar-coder/shipyard/internal/metrics"
+	"github.com/gabbygtobar-coder/shipyard/internal/requestid"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
 
@@ -42,6 +44,13 @@ type AppRuntime interface {
 	Stop(ctx context.Context, appName string) (deploymentID string, err error)
 }
 
+// ReadyCheck reports whether a dependency can take work.
+type ReadyCheck interface {
+	Ready(ctx context.Context) error
+}
+
+type loggerKey struct{}
+
 // handler serves the shipyard HTTP API.
 type handler struct {
 	store         store.Store
@@ -49,6 +58,9 @@ type handler struct {
 	run           AppRuntime
 	log           *slog.Logger
 	webhookSecret string
+	metrics       *metrics.Metrics
+	ready         ReadyCheck
+	uiToken       string
 }
 
 // Option configures the HTTP API.
@@ -59,6 +71,31 @@ type Option func(*handler)
 func WithWebhookSecret(secret string) Option {
 	return func(h *handler) {
 		h.webhookSecret = secret
+	}
+}
+
+// WithMetrics records API and webhook metrics and serves GET /metrics.
+// A nil value leaves metrics disabled.
+func WithMetrics(m *metrics.Metrics) Option {
+	return func(h *handler) {
+		h.metrics = m
+	}
+}
+
+// WithReadyCheck makes GET /readyz call check after the store ping.
+// A nil check only pings the store.
+func WithReadyCheck(check ReadyCheck) Option {
+	return func(h *handler) {
+		h.ready = check
+	}
+}
+
+// WithUIToken enables the dashboard at /ui.
+// Requests must send the token as an HTTP Basic password or a Bearer token.
+// An empty token leaves the dashboard refusing every request.
+func WithUIToken(token string) Option {
+	return func(h *handler) {
+		h.uiToken = token
 	}
 }
 
@@ -79,6 +116,14 @@ func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
+	mux.HandleFunc("GET /readyz", h.readyz)
+	if h.metrics != nil {
+		mux.Handle("GET /metrics", h.metrics.Handler())
+	}
+	mux.HandleFunc("GET /ui", h.uiIndex)
+	mux.HandleFunc("GET /ui/{$}", h.uiIndex)
+	mux.HandleFunc("GET /ui/apps/{name}", h.uiApp)
+	mux.HandleFunc("POST /ui/apps/{name}/rollback", h.uiRollback)
 	mux.HandleFunc("POST /webhooks/github", h.githubWebhook)
 	mux.HandleFunc("POST /apps", h.createApp)
 	mux.HandleFunc("GET /apps", h.listApps)
@@ -87,6 +132,7 @@ func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger,
 	mux.HandleFunc("POST /apps/{name}/stop", h.stopApp)
 	mux.HandleFunc("POST /apps/{name}/rollback", h.rollbackApp)
 	mux.HandleFunc("GET /apps/{name}/releases", h.listReleases)
+	mux.HandleFunc("GET /apps/{name}/events", h.listEvents)
 	mux.HandleFunc("GET /apps/{name}", h.getApp)
 	mux.HandleFunc("POST /apps/{name}/deployments", h.createDeployment)
 	mux.HandleFunc("GET /apps/{name}/deployments", h.listDeployments)
@@ -98,6 +144,12 @@ func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger,
 func (h *handler) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		id := requestid.FromRequest(r)
+		logger := requestid.Logger(h.log, id)
+		ctx := requestid.With(r.Context(), id)
+		ctx = context.WithValue(ctx, loggerKey{}, logger)
+		r = r.WithContext(ctx)
+		w.Header().Set(requestid.Header, id)
 		sw := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		defer func() {
 			rec := recover()
@@ -106,7 +158,7 @@ func (h *handler) wrap(next http.Handler) http.Handler {
 				if err, ok := rec.(error); ok && errors.Is(err, http.ErrAbortHandler) {
 					abort = true
 				} else {
-					h.log.Error("panic",
+					logger.Error("panic",
 						"err", fmt.Sprint(rec),
 						"method", r.Method,
 						"path", r.URL.Path,
@@ -115,7 +167,7 @@ func (h *handler) wrap(next http.Handler) http.Handler {
 					writeError(sw, http.StatusInternalServerError, errInternal)
 				}
 			}
-			h.log.Info("request",
+			logger.Info("request",
 				"method", r.Method,
 				"path", r.URL.Path,
 				"status", sw.status,
@@ -127,6 +179,15 @@ func (h *handler) wrap(next http.Handler) http.Handler {
 		}()
 		next.ServeHTTP(sw, r)
 	})
+}
+
+func (h *handler) logger(ctx context.Context) *slog.Logger {
+	if ctx != nil {
+		if logger, ok := ctx.Value(loggerKey{}).(*slog.Logger); ok && logger != nil {
+			return logger
+		}
+	}
+	return h.log
 }
 
 type statusRecorder struct {

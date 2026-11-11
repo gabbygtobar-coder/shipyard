@@ -53,7 +53,7 @@ func (h *handler) rollbackApp(w http.ResponseWriter, r *http.Request) {
 	}
 	dep, err := rollbacks.Rollback(r.Context(), name, deploymentID)
 	if err != nil {
-		h.writeRollbackError(w, err)
+		h.writeRollbackError(w, r, err)
 		return
 	}
 	w.Header().Set("Location", "/deployments/"+url.PathEscape(dep.ID))
@@ -68,7 +68,7 @@ func (h *handler) listReleases(w http.ResponseWriter, r *http.Request) {
 	}
 	releases, err := h.store.ListReleases(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	if releases == nil {
@@ -77,7 +77,7 @@ func (h *handler) listReleases(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, releaseListResponse{Releases: releases})
 }
 
-func (h *handler) writeRollbackError(w http.ResponseWriter, err error) {
+func (h *handler) writeRollbackError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, deploy.ErrNoRelease), errors.Is(err, deploy.ErrAlreadyCurrent):
 		writeError(w, http.StatusConflict, err.Error())
@@ -88,7 +88,7 @@ func (h *handler) writeRollbackError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrNotFound):
 		writeError(w, http.StatusNotFound, errAppNotFound)
 	default:
-		h.writeBuildError(w, err)
+		h.writeBuildError(w, r, err)
 	}
 }
 

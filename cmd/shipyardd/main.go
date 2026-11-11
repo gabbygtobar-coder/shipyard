@@ -20,6 +20,7 @@ import (
 	"github.com/gabbygtobar-coder/shipyard/internal/build"
 	"github.com/gabbygtobar-coder/shipyard/internal/config"
 	"github.com/gabbygtobar-coder/shipyard/internal/deploy"
+	"github.com/gabbygtobar-coder/shipyard/internal/metrics"
 	"github.com/gabbygtobar-coder/shipyard/internal/proxy"
 	"github.com/gabbygtobar-coder/shipyard/internal/route"
 	"github.com/gabbygtobar-coder/shipyard/internal/runtime"
@@ -79,6 +80,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 	albDNS := fs.String("alb-dns-name", flagDefaults.ALBDNSName, "ALB DNS name without a scheme (env "+config.EnvALBDNSName+")")
 	baseDomain := fs.String("base-domain", flagDefaults.BaseDomain, "optional parent domain for host rules (env "+config.EnvBaseDomain+")")
 	ecsDeployTimeout := fs.Duration("ecs-deploy-timeout", flagDefaults.ECSDeployTimeout, "ECS rollout time limit (env "+config.EnvECSDeployTimeout+")")
+	monitorInterval := fs.Duration("monitor-interval", flagDefaults.MonitorInterval, "how often to probe running apps (env "+config.EnvMonitorInterval+")")
+	monitorThreshold := fs.Int("monitor-threshold", flagDefaults.MonitorThreshold, "consecutive probe failures before an app is unhealthy (env "+config.EnvMonitorThreshold+")")
+	autoRestart := fs.Bool("auto-restart", flagDefaults.AutoRestart, "restart a local container after repeated health failures (env "+config.EnvAutoRestart+")")
 	fs.Usage = func() {
 		fprintf(fs.Output(), "Usage: shipyardd [--addr %s] [--proxy-addr %s]\n", config.DefaultAddr, config.DefaultProxyAddr)
 		fs.PrintDefaults()
@@ -128,6 +132,10 @@ func run(args []string, stdout, stderr io.Writer) int {
 		ALBDNSName:          strings.TrimSpace(*albDNS),
 		BaseDomain:          strings.TrimSpace(*baseDomain),
 		ECSDeployTimeout:    *ecsDeployTimeout,
+		MonitorInterval:     *monitorInterval,
+		MonitorThreshold:    *monitorThreshold,
+		AutoRestart:         *autoRestart,
+		UIToken:             loaded.UIToken,
 	}
 	if err := cfg.Check(); err != nil {
 		fprintf(stderr, "config: %s\n", err)
@@ -164,6 +172,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 		logger.Error("runtime", "err", err)
 		return 1
 	}
+	collected, err := metrics.New(nil, st.CountActiveDeployments)
+	if err != nil {
+		logger.Error("metrics", "err", err)
+		return 1
+	}
 	runner, err := deploy.New(deploy.Config{
 		Store:          st,
 		Cloner:         source.NewGit(cfg.CloneMaxBytes),
@@ -175,6 +188,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		CloneTimeout:   cfg.CloneTimeout,
 		ReleaseHistory: cfg.ReleaseHistory,
 		Images:         wired.images,
+		Metrics:        collected,
 		Logger:         logger,
 	})
 	if err != nil {
@@ -184,15 +198,48 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	var restarter runtime.Restarter
+	if cfg.AutoRestart {
+		if local, ok := wired.rt.(runtime.Restarter); ok {
+			restarter = local
+		} else {
+			logger.Info("auto-restart unavailable", "runtime", cfg.Runtime)
+		}
+	}
+	probeTimeout := 2 * time.Second
+	if cfg.HealthTimeout < probeTimeout {
+		probeTimeout = cfg.HealthTimeout
+	}
+	monitor, err := runtime.NewMonitor(runtime.MonitorConfig{
+		Store:        st,
+		Routes:       routes,
+		Path:         cfg.HealthPath,
+		Interval:     cfg.MonitorInterval,
+		Threshold:    cfg.MonitorThreshold,
+		AutoRestart:  cfg.AutoRestart,
+		Restarter:    restarter,
+		ProbeTimeout: probeTimeout,
+		Logger:       logger,
+	})
+	if err != nil {
+		logger.Error("health monitor", "err", err)
+		return 1
+	}
 	if err := runner.Start(ctx); err != nil {
 		logger.Error("start builds", "err", err)
 		return 1
 	}
 	defer runner.Stop()
 
+	var ready api.ReadyCheck
+	if check, ok := wired.rt.(api.ReadyCheck); ok {
+		ready = check
+	}
+	appProxy := proxy.New(routes, logger)
+	appProxy.SetObserver(collected)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewHandler(st, runner, logger, supervisor, api.WithWebhookSecret(cfg.WebhookSecret)),
+		Handler:           api.NewHandler(st, runner, logger, supervisor, api.WithWebhookSecret(cfg.WebhookSecret), api.WithMetrics(collected), api.WithReadyCheck(ready), api.WithUIToken(cfg.UIToken)),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -200,7 +247,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	proxySrv := &http.Server{
 		Addr:              cfg.ProxyAddr,
-		Handler:           proxy.New(routes, logger),
+		Handler:           appProxy,
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -208,6 +255,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 
 	errCh := make(chan error, 2)
+	go monitor.Run(ctx)
 	go func() {
 		logger.Info("listening",
 			"addr", cfg.Addr,
@@ -216,6 +264,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 			"db", cfg.DBPath,
 			"runtime", cfg.Runtime,
 			"webhook", cfg.WebhookSecret != "",
+			"ui", cfg.UIToken != "",
+			"auto_restart", cfg.AutoRestart && restarter != nil,
 		)
 		errCh <- srv.ListenAndServe()
 	}()

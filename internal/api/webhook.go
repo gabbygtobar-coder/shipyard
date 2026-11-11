@@ -32,6 +32,7 @@ type webhookResponse struct {
 func (h *handler) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	body, err := readLimited(w, r, maxWebhookBytes)
 	if err != nil {
+		h.metrics.ObserveWebhook("invalid")
 		writeDecodeError(w, err)
 		return
 	}
@@ -40,32 +41,41 @@ func (h *handler) githubWebhook(w http.ResponseWriter, r *http.Request) {
 	signature := r.Header.Get(headerHubSignature256)
 	matched, ok, err := h.authorizedApps(r.Context(), body, signature)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.metrics.ObserveWebhook("error")
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	if !ok {
+		h.metrics.ObserveWebhook("unauthorized")
 		writeError(w, http.StatusUnauthorized, errInvalidSignature)
 		return
 	}
 	claimed, err := h.store.ClaimDelivery(r.Context(), delivery)
 	if err != nil {
 		if errors.Is(err, store.ErrInvalid) {
+			h.metrics.ObserveWebhook("invalid")
 			writeError(w, http.StatusBadRequest, errInvalidDelivery)
 			return
 		}
-		h.writeStoreError(w, err, errAppNotFound)
+		h.metrics.ObserveWebhook("error")
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	if !claimed {
+		h.metrics.ObserveWebhook("duplicate")
 		writeJSON(w, http.StatusAccepted, webhookResponse{Status: "duplicate"})
 		return
 	}
 	switch event {
 	case "ping":
+		h.noteWebhook(r.Context(), matched, "ping")
+		h.metrics.ObserveWebhook("pong")
 		writeJSON(w, http.StatusOK, webhookResponse{Status: "pong"})
 	case "push":
 		h.handlePush(w, r, delivery, body, matched)
 	default:
+		h.noteWebhook(r.Context(), matched, "ignored event "+event)
+		h.metrics.ObserveWebhook("ignored")
 		writeJSON(w, http.StatusAccepted, webhookResponse{Status: "ignored"})
 	}
 }
@@ -77,10 +87,13 @@ func (h *handler) handlePush(w http.ResponseWriter, r *http.Request, delivery st
 	push, err := webhook.ParsePush(body)
 	if err != nil && !errors.Is(err, webhook.ErrIgnored) {
 		forget()
+		h.metrics.ObserveWebhook("invalid")
 		writeError(w, http.StatusBadRequest, errInvalidJSON)
 		return
 	}
 	if err != nil || push.Deleted || push.Branch == "" {
+		h.noteWebhook(r.Context(), matched, "ignored push")
+		h.metrics.ObserveWebhook("ignored")
 		writeJSON(w, http.StatusAccepted, webhookResponse{Status: "ignored"})
 		return
 	}
@@ -88,12 +101,14 @@ func (h *handler) handlePush(w http.ResponseWriter, r *http.Request, delivery st
 	coalesced := false
 	for _, app := range matched {
 		if !app.AutoDeploy || app.Branch != push.Branch {
+			h.noteWebhook(r.Context(), []store.App{app}, "ignored push of "+push.Branch)
 			continue
 		}
 		pushes, ok := h.builds.(pushService)
 		if !ok || h.builds == nil {
 			if len(ids) == 0 {
 				forget()
+				h.metrics.ObserveWebhook("error")
 				writeError(w, http.StatusServiceUnavailable, errBuildsUnconfigured)
 				return
 			}
@@ -101,18 +116,22 @@ func (h *handler) handlePush(w http.ResponseWriter, r *http.Request, delivery st
 		}
 		dep, coal, startErr := pushes.StartPush(r.Context(), app.Name, push.Branch, push.SHA)
 		if startErr != nil {
-			h.log.Error("webhook deploy", "app", app.Name, "err", startErr)
+			h.logger(r.Context()).Error("webhook deploy", "app", app.Name, "err", startErr)
 			if len(ids) == 0 {
 				forget()
-				h.writeBuildError(w, startErr)
+				h.noteWebhook(r.Context(), []store.App{app}, "push failed")
+				h.metrics.ObserveWebhook("error")
+				h.writeBuildError(w, r, startErr)
 				return
 			}
 			break
 		}
+		h.noteWebhook(r.Context(), []store.App{app}, "push "+push.SHA+" on "+push.Branch)
 		ids = append(ids, dep.ID)
 		coalesced = coalesced || coal
 	}
 	if len(ids) == 0 {
+		h.metrics.ObserveWebhook("ignored")
 		writeJSON(w, http.StatusAccepted, webhookResponse{Status: "ignored"})
 		return
 	}
@@ -120,7 +139,23 @@ func (h *handler) handlePush(w http.ResponseWriter, r *http.Request, delivery st
 	if coalesced {
 		status = "coalesced"
 	}
+	h.metrics.ObserveWebhook(status)
 	writeJSON(w, http.StatusAccepted, webhookResponse{Status: status, Deployments: ids})
+}
+
+func (h *handler) noteWebhook(ctx context.Context, apps []store.App, message string) {
+	if len(message) > store.MaxEventMessageBytes {
+		message = message[:store.MaxEventMessageBytes]
+	}
+	for _, app := range apps {
+		if _, err := h.store.AppendEvent(ctx, store.Event{
+			AppName: app.Name,
+			Type:    store.EventWebhookReceived,
+			Message: message,
+		}); err != nil {
+			h.logger(ctx).Error("webhook event", "app", app.Name, "err", err)
+		}
+	}
 }
 
 func (h *handler) authorizedApps(ctx context.Context, body []byte, signature string) ([]store.App, bool, error) {

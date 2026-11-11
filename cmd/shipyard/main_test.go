@@ -95,6 +95,24 @@ func TestCLICreateListGet(t *testing.T) {
 	}
 }
 
+func TestCLIEvents(t *testing.T) {
+	t.Parallel()
+	srv := testAPI(t)
+	getenv := func(string) string { return "" }
+	code, _, stderr := runCLI(t, []string{"--api-url", srv.URL, "apps", "create", "--name", "demo", "--repo", "https://github.com/acme/demo"}, getenv)
+	if code != 0 {
+		t.Fatalf("create %d %s", code, stderr)
+	}
+	code, stdout, stderr := runCLI(t, []string{"--api-url", srv.URL, "events", "demo"}, getenv)
+	if code != 0 || !strings.Contains(stdout, `"events"`) {
+		t.Fatalf("events code %d stdout %s stderr %s", code, stdout, stderr)
+	}
+	code, _, stderr = runCLI(t, []string{"events"}, getenv)
+	if code != 2 || !strings.Contains(stderr, "usage:") {
+		t.Fatalf("usage code %d stderr %s", code, stderr)
+	}
+}
+
 func TestCLIAPIURLFlagOverridesEnv(t *testing.T) {
 	t.Parallel()
 	srv := testAPI(t)

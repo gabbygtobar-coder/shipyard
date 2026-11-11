@@ -75,12 +75,12 @@ func (h *handler) createApp(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if _, err := h.store.CreateApp(r.Context(), name, repoURL); err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	app, err := h.store.ConfigureApp(r.Context(), name, settings)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	w.Header().Set("Location", "/apps/"+url.PathEscape(name))
@@ -90,7 +90,7 @@ func (h *handler) createApp(w http.ResponseWriter, r *http.Request) {
 func (h *handler) listApps(w http.ResponseWriter, r *http.Request) {
 	apps, err := h.store.ListApps(r.Context())
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	if apps == nil {
@@ -112,7 +112,7 @@ func (h *handler) updateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	app, err := h.store.GetApp(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	branch := app.Branch
@@ -134,7 +134,7 @@ func (h *handler) updateApp(w http.ResponseWriter, r *http.Request) {
 	}
 	app, err = h.store.ConfigureApp(r.Context(), name, settings)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, app)
@@ -162,13 +162,13 @@ func (h *handler) getApp(w http.ResponseWriter, r *http.Request) {
 	}
 	app, err := h.store.GetApp(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, app)
 }
 
-func (h *handler) writeStoreError(w http.ResponseWriter, err error, notFound string) {
+func (h *handler) writeStoreError(w http.ResponseWriter, r *http.Request, err error, notFound string) {
 	switch {
 	case errors.Is(err, store.ErrAlreadyExists):
 		writeError(w, http.StatusConflict, errAppExists)
@@ -179,7 +179,11 @@ func (h *handler) writeStoreError(w http.ResponseWriter, err error, notFound str
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		writeError(w, http.StatusRequestTimeout, errCanceled)
 	default:
-		h.log.Error("store", "err", err)
+		ctx := context.Background()
+		if r != nil {
+			ctx = r.Context()
+		}
+		h.logger(ctx).Error("store", "err", err)
 		writeError(w, http.StatusInternalServerError, errInternal)
 	}
 }

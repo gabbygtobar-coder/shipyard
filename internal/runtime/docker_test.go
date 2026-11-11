@@ -265,6 +265,26 @@ func TestDockerRemoveImage(t *testing.T) {
 	}
 }
 
+func TestDockerReadyAndRestart(t *testing.T) {
+	t.Parallel()
+	s := &script{}
+	d := testDocker(s)
+	if err := d.Ready(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	id := "0123456789abcdef"
+	if err := d.Restart(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Restart(context.Background(), "nope"); err == nil {
+		t.Fatal("expected an invalid id")
+	}
+	cmds := s.commands()
+	if len(cmds) != 2 || cmds[0].args[0] != "info" || cmds[1].args[0] != "restart" || cmds[1].args[len(cmds[1].args)-1] != id {
+		t.Fatalf("commands %#v", cmds)
+	}
+}
+
 func TestParseStatus(t *testing.T) {
 	t.Parallel()
 	status, err := parseStatus("abc", "false|137|died\n")

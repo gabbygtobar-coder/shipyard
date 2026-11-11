@@ -47,6 +47,10 @@ const (
 	DefaultRuntime = RuntimeDocker
 	// DefaultECSDeployTimeout bounds an ECS rollout, including image pull.
 	DefaultECSDeployTimeout = 10 * time.Minute
+	// DefaultMonitorInterval is how often running apps are probed after they are healthy.
+	DefaultMonitorInterval = 10 * time.Second
+	// DefaultMonitorThreshold is how many consecutive probe failures mark an app unhealthy.
+	DefaultMonitorThreshold = 3
 	// DefaultDBPath is the SQLite file used when SHIPYARD_DB is unset.
 	DefaultDBPath = "shipyard.db"
 	// MemoryDBPath selects the in-memory store instead of SQLite.
@@ -115,6 +119,15 @@ const (
 	EnvBaseDomain = "SHIPYARD_BASE_DOMAIN"
 	// EnvECSDeployTimeout bounds the ECS rollout. Use Go duration syntax, such as 10m.
 	EnvECSDeployTimeout = "SHIPYARD_ECS_DEPLOY_TIMEOUT"
+	// EnvMonitorInterval is how often the health monitor probes running apps.
+	EnvMonitorInterval = "SHIPYARD_MONITOR_INTERVAL"
+	// EnvMonitorThreshold is the consecutive probe failures that mark an app unhealthy.
+	EnvMonitorThreshold = "SHIPYARD_MONITOR_THRESHOLD"
+	// EnvAutoRestart restarts a local container after the health monitor marks it unhealthy.
+	// It has no effect on the ECS runtime.
+	EnvAutoRestart = "SHIPYARD_AUTO_RESTART"
+	// EnvUIToken is the dashboard password. It is not a flag and is never logged.
+	EnvUIToken = "SHIPYARD_UI_TOKEN"
 
 	// RuntimeDocker runs containers on the local Docker daemon.
 	RuntimeDocker = "docker"
@@ -144,6 +157,10 @@ const (
 	maxWebhookSecret    = 256
 	minECSDeployTimeout = time.Minute
 	maxECSDeployTimeout = 15 * time.Minute
+	minMonitorInterval  = time.Second
+	maxMonitorInterval  = 5 * time.Minute
+	maxMonitorThreshold = 20
+	maxUIToken          = 256
 )
 
 var (
@@ -219,6 +236,15 @@ type Config struct {
 	BaseDomain string
 	// ECSDeployTimeout bounds an ECS rollout.
 	ECSDeployTimeout time.Duration
+	// MonitorInterval is how often running apps are probed.
+	MonitorInterval time.Duration
+	// MonitorThreshold is the consecutive failures that mark an app unhealthy.
+	MonitorThreshold int
+	// AutoRestart restarts a local container once when the monitor marks it unhealthy.
+	AutoRestart bool
+	// UIToken is the HTTP basic password for /ui. Empty refuses every dashboard request.
+	// It must never be logged.
+	UIToken string
 }
 
 // Defaults returns configuration with no environment overrides applied.
@@ -241,6 +267,8 @@ func Defaults() Config {
 		ReleaseHistory:   DefaultReleaseHistory,
 		Runtime:          DefaultRuntime,
 		ECSDeployTimeout: DefaultECSDeployTimeout,
+		MonitorInterval:  DefaultMonitorInterval,
+		MonitorThreshold: DefaultMonitorThreshold,
 	}
 }
 
@@ -304,6 +332,15 @@ func (c Config) Check() error {
 		return err
 	}
 	if err := c.checkRuntime(); err != nil {
+		return err
+	}
+	if c.MonitorInterval < minMonitorInterval || c.MonitorInterval > maxMonitorInterval {
+		return fmt.Errorf("monitor interval must be from %s to %s", minMonitorInterval, maxMonitorInterval)
+	}
+	if c.MonitorThreshold < 1 || c.MonitorThreshold > maxMonitorThreshold {
+		return fmt.Errorf("monitor threshold must be from 1 to %d", maxMonitorThreshold)
+	}
+	if err := checkUIToken(c.UIToken); err != nil {
 		return err
 	}
 	return nil
@@ -395,6 +432,19 @@ func Load() (Config, error) {
 	if cfg.ECSDeployTimeout, err = envDurationRange(EnvECSDeployTimeout, DefaultECSDeployTimeout, minECSDeployTimeout, maxECSDeployTimeout); err != nil {
 		return Config{}, err
 	}
+	if cfg.MonitorInterval, err = envDurationRange(EnvMonitorInterval, DefaultMonitorInterval, minMonitorInterval, maxMonitorInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.MonitorThreshold, err = envInt(EnvMonitorThreshold, DefaultMonitorThreshold, maxMonitorThreshold); err != nil {
+		return Config{}, err
+	}
+	if cfg.AutoRestart, err = envBool(EnvAutoRestart, false); err != nil {
+		return Config{}, err
+	}
+	cfg.UIToken = os.Getenv(EnvUIToken)
+	if err := checkUIToken(cfg.UIToken); err != nil {
+		return Config{}, fmt.Errorf("%s is invalid", EnvUIToken)
+	}
 	if err := cfg.checkRuntime(); err != nil {
 		return Config{}, err
 	}
@@ -416,6 +466,28 @@ func checkDBPath(path string) error {
 		return fmt.Errorf("database path is invalid")
 	}
 	return nil
+}
+
+func checkUIToken(token string) error {
+	if len(token) > maxUIToken || strings.ContainsRune(token, 0) {
+		return fmt.Errorf("ui token is invalid")
+	}
+	return nil
+}
+
+func envBool(key string, def bool) (bool, error) {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes":
+		return true, nil
+	case "0", "false", "no":
+		return false, nil
+	default:
+		return false, fmt.Errorf("%s must be true or false", key)
+	}
 }
 
 func checkWebhookSecret(secret string) error {
