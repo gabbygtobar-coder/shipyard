@@ -3,7 +3,9 @@
 // M0 ships an in-memory implementation. M1 records image builds in the same
 // store: status, git ref, commit, image tag, timestamps, error text, and the
 // captured build log. M2 adds the running and stopped statuses, a public URL,
-// and the app's current routing status. That state is still only in memory.
+// and the app's current routing status. M4 adds the branch, auto-deploy
+// setting, webhook delivery ids, and the releases kept for rollback. Memory
+// is still what tests use. SQLite is the durable implementation.
 package store
 
 import (
@@ -52,16 +54,36 @@ const (
 
 	// MaxDeploymentLogBytes is the captured build log kept per deployment.
 	MaxDeploymentLogBytes = 1 << 20
+
+	// DefaultBranch is the branch push events deploy when an app does not set one.
+	DefaultBranch = "main"
+	// MaxWebhookSecretBytes is the longest per-app webhook secret that is stored.
+	MaxWebhookSecretBytes = 256
+	// MaxDeliveryIDBytes is the longest GitHub delivery id that is stored.
+	MaxDeliveryIDBytes = 128
 )
 
 // App is a registered source repository.
-// Status and URL describe the in-memory routing state. They are not durable.
+// Status and URL describe where traffic is routed.
+// WebhookSecret is the per-app GitHub HMAC secret. It is never serialized.
 type App struct {
-	Name      string    `json:"name"`
-	RepoURL   string    `json:"repo_url"`
-	Status    string    `json:"status"`
-	URL       string    `json:"url,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	Name          string    `json:"name"`
+	RepoURL       string    `json:"repo_url"`
+	Branch        string    `json:"branch"`
+	AutoDeploy    bool      `json:"auto_deploy"`
+	Status        string    `json:"status"`
+	URL           string    `json:"url,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	WebhookSecret string    `json:"-"`
+}
+
+// AppSettings is the push-to-deploy configuration for an app.
+// An empty Branch means DefaultBranch. An empty WebhookSecret clears nothing
+// by itself: ConfigureApp stores the value it is given, including empty.
+type AppSettings struct {
+	Branch        string
+	AutoDeploy    bool
+	WebhookSecret string
 }
 
 // Deployment is a stored deploy record for an app.
@@ -75,9 +97,22 @@ type Deployment struct {
 	ImageTag   string     `json:"image_tag"`
 	URL        string     `json:"url,omitempty"`
 	Error      string     `json:"error"`
+	RollbackOf string     `json:"rollback_of,omitempty"`
 	CreatedAt  time.Time  `json:"created_at"`
 	StartedAt  *time.Time `json:"started_at,omitempty"`
 	FinishedAt *time.Time `json:"finished_at,omitempty"`
+}
+
+// Release is one successful image kept for rollback.
+// CreatedAt is when the release was recorded, which is when the deployment
+// became running or succeeded.
+type Release struct {
+	AppName      string    `json:"app_name"`
+	DeploymentID string    `json:"deployment_id"`
+	Ref          string    `json:"ref"`
+	CommitSHA    string    `json:"commit_sha"`
+	ImageTag     string    `json:"image_tag"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 // DeploymentUpdate patches a deployment.
@@ -117,6 +152,11 @@ type Store interface {
 	// SetAppStatus records whether an app is idle, running, or stopped.
 	// A running app requires a public URL. Idle and stopped clear it.
 	SetAppStatus(ctx context.Context, name, status, appURL string) (App, error)
+	// ConfigureApp sets the branch, auto-deploy flag, and per-app webhook secret.
+	ConfigureApp(ctx context.Context, name string, settings AppSettings) (App, error)
+	// ListAppsByRepo returns apps whose stored repository URL matches repoURL
+	// after canonicalization, in creation order.
+	ListAppsByRepo(ctx context.Context, repoURL string) ([]App, error)
 
 	// CreateDeployment stores a deployment for an existing app.
 	// status must be 1-32 characters of lowercase letters, digits, '_' or '-'.
@@ -139,6 +179,21 @@ type Store interface {
 	// WaitDeploymentLog returns when the log grows past offset, the deployment
 	// reaches a terminal status, or ctx is done.
 	WaitDeploymentLog(ctx context.Context, id string, offset int) error
+
+	// ClaimDelivery records a GitHub delivery id.
+	// The first call returns true. A repeat of the same id returns false.
+	ClaimDelivery(ctx context.Context, id string) (bool, error)
+	// ForgetDelivery removes a delivery id so the sender can retry it.
+	ForgetDelivery(ctx context.Context, id string) error
+
+	// CreateRollback stores a queued deployment that redeploys source's image.
+	CreateRollback(ctx context.Context, appName string, source Release) (Deployment, error)
+	// RecordRelease keeps a successful deployment and drops the oldest releases
+	// beyond keep. keep must be at least 1. Recording the same deployment again
+	// does not change the list. Dropped releases are returned oldest first.
+	RecordRelease(ctx context.Context, deploymentID string, keep int) ([]Release, error)
+	// ListReleases returns retained releases for one app, newest first.
+	ListReleases(ctx context.Context, appName string) ([]Release, error)
 }
 
 // IsTerminalStatus reports whether log streaming can stop.

@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	defaultConcurrency  = 2
-	defaultQueueSize    = 16
-	defaultBuildTimeout = 10 * time.Minute
-	defaultCloneTimeout = 2 * time.Minute
+	defaultConcurrency    = 2
+	defaultQueueSize      = 16
+	defaultBuildTimeout   = 10 * time.Minute
+	defaultCloneTimeout   = 2 * time.Minute
+	defaultReleaseHistory = 5
 
 	msgCloneFailed       = "git clone failed"
 	msgCloneTimedOut     = "git clone timed out"
@@ -63,20 +64,28 @@ type Releaser interface {
 	Release(ctx context.Context, appName, deploymentID, image string, logs io.Writer) error
 }
 
+// ImageRemover deletes an image that is no longer retained.
+// The local Docker runtime and a future registry runtime can both implement it.
+type ImageRemover interface {
+	RemoveImage(ctx context.Context, tag string) error
+}
+
 // Config configures a Runner.
 // Zero concurrency, queue size, and timeouts are replaced with defaults.
 // A nil Releaser keeps the M1 behavior: a built image is marked succeeded.
 type Config struct {
-	Store        store.Store
-	Cloner       source.Cloner
-	Builder      build.Builder
-	Releaser     Releaser
-	Concurrency  int
-	QueueSize    int
-	BuildTimeout time.Duration
-	CloneTimeout time.Duration
-	Logger       *slog.Logger
-	Now          func() time.Time
+	Store          store.Store
+	Cloner         source.Cloner
+	Builder        build.Builder
+	Releaser       Releaser
+	Concurrency    int
+	QueueSize      int
+	BuildTimeout   time.Duration
+	CloneTimeout   time.Duration
+	Logger         *slog.Logger
+	Now            func() time.Time
+	ReleaseHistory int
+	Images         ImageRemover
 }
 
 // Runner executes builds on a fixed set of workers.
@@ -91,9 +100,12 @@ type Runner struct {
 	cloneTimeout time.Duration
 	log          *slog.Logger
 	now          func() time.Time
+	images       ImageRemover
+	releaseKeep  int
 
 	mu      sync.Mutex
 	jobs    chan string
+	pending map[string]string
 	started bool
 	stopped bool
 	ctx     context.Context
@@ -127,17 +139,23 @@ func New(cfg Config) (*Runner, error) {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
+	if cfg.ReleaseHistory <= 0 {
+		cfg.ReleaseHistory = defaultReleaseHistory
+	}
 	return &Runner{
 		store:        cfg.Store,
 		cloner:       cfg.Cloner,
 		builder:      cfg.Builder,
 		releaser:     cfg.Releaser,
+		images:       cfg.Images,
 		concurrency:  cfg.Concurrency,
 		queueCap:     cfg.QueueSize,
 		buildTimeout: cfg.BuildTimeout,
 		cloneTimeout: cfg.CloneTimeout,
+		releaseKeep:  cfg.ReleaseHistory,
 		log:          cfg.Logger,
 		now:          cfg.Now,
+		pending:      make(map[string]string),
 	}, nil
 }
 
@@ -202,10 +220,113 @@ func (r *Runner) StartBuild(ctx context.Context, appName, ref string) (store.Dep
 	return dep, nil
 }
 
+// StartPush queues a build of an exact commit, or updates the queued build for
+// appName when one is already waiting. The second result is true when an
+// existing queued build was updated instead of creating another one.
+func (r *Runner) StartPush(ctx context.Context, appName, branch, commitSHA string) (store.Deployment, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return store.Deployment{}, false, err
+	}
+	appName = strings.TrimSpace(appName)
+	branch = strings.TrimSpace(branch)
+	commitSHA = strings.ToLower(strings.TrimSpace(commitSHA))
+	if appName == "" || branch == "" || giturl.ValidateRef(branch) != nil || !giturl.ValidSHA(commitSHA) {
+		return store.Deployment{}, false, store.ErrInvalid
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.started || r.stopped {
+		return store.Deployment{}, false, ErrStopped
+	}
+	if id, ok := r.pending[appName]; ok {
+		dep, err := r.store.UpdateDeployment(ctx, id, store.DeploymentUpdate{Ref: &branch, CommitSHA: &commitSHA})
+		if err != nil {
+			return store.Deployment{}, false, err
+		}
+		return dep, true, nil
+	}
+	if len(r.jobs) >= cap(r.jobs) {
+		return store.Deployment{}, false, ErrQueueFull
+	}
+	dep, err := r.store.CreateBuild(ctx, appName, branch)
+	if err != nil {
+		return store.Deployment{}, false, err
+	}
+	updated, err := r.store.UpdateDeployment(ctx, dep.ID, store.DeploymentUpdate{CommitSHA: &commitSHA})
+	if err != nil {
+		failed := store.DeploymentStatusFailed
+		msg := msgInternal
+		now := r.now().UTC()
+		_, _ = r.store.UpdateDeployment(context.Background(), dep.ID, store.DeploymentUpdate{
+			Status:     &failed,
+			Error:      &msg,
+			FinishedAt: &now,
+		})
+		return store.Deployment{}, false, err
+	}
+	r.pending[appName] = updated.ID
+	r.jobs <- updated.ID
+	return updated, false, nil
+}
+
+// Rollback queues a redeploy of a retained image. An empty deploymentID selects
+// the release before the one that is running, or the newest release when
+// nothing is running.
+func (r *Runner) Rollback(ctx context.Context, appName, deploymentID string) (store.Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return store.Deployment{}, err
+	}
+	appName = strings.TrimSpace(appName)
+	deploymentID = strings.TrimSpace(deploymentID)
+	if appName == "" {
+		return store.Deployment{}, store.ErrInvalid
+	}
+	if _, err := r.store.GetApp(ctx, appName); err != nil {
+		return store.Deployment{}, err
+	}
+	releases, err := r.store.ListReleases(ctx, appName)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	deps, err := r.store.ListDeployments(ctx, appName)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	rel, err := SelectRelease(releases, currentRunning(deps), deploymentID)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.started || r.stopped {
+		return store.Deployment{}, ErrStopped
+	}
+	if len(r.jobs) >= cap(r.jobs) {
+		return store.Deployment{}, ErrQueueFull
+	}
+	dep, err := r.store.CreateRollback(ctx, appName, rel)
+	if err != nil {
+		return store.Deployment{}, err
+	}
+	r.jobs <- dep.ID
+	return dep, nil
+}
+
 func (r *Runner) worker() {
 	defer r.wg.Done()
 	for id := range r.jobs {
+		r.clearPending(id)
 		r.execute(id)
+	}
+}
+
+func (r *Runner) clearPending(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for app, pending := range r.pending {
+		if pending == id {
+			delete(r.pending, app)
+		}
 	}
 }
 
@@ -218,6 +339,16 @@ func (r *Runner) execute(id string) {
 	}()
 	if r.ctx.Err() != nil {
 		r.finish(id, store.DeploymentStatusFailed, "", "", msgCanceled)
+		return
+	}
+	peek, peekErr := r.store.GetDeployment(context.Background(), id)
+	if peekErr != nil {
+		r.log.Error("load deployment", "deployment", id, "err", peekErr)
+		r.finish(id, store.DeploymentStatusFailed, "", "", msgInternal)
+		return
+	}
+	if peek.RollbackOf != "" {
+		r.executeRollback(peek)
 		return
 	}
 
@@ -268,7 +399,11 @@ func (r *Runner) execute(id string) {
 
 	cloneCtx, cloneCancel := context.WithTimeout(jobCtx, r.cloneTimeout)
 	defer cloneCancel()
-	sha, cloneErr := r.cloner.Clone(cloneCtx, app.RepoURL, dep.Ref, dir, &logs)
+	cloneRef := dep.Ref
+	if giturl.ValidSHA(dep.CommitSHA) {
+		cloneRef = dep.CommitSHA
+	}
+	sha, cloneErr := r.cloner.Clone(cloneCtx, app.RepoURL, cloneRef, dir, &logs)
 	if cloneErr != nil {
 		_, _ = fmt.Fprintf(&logs, "error: %s\n", cloneErr.Error())
 		fail("", cloneFailure(r.ctx, jobCtx, cloneCtx, cloneErr))
@@ -333,6 +468,7 @@ func (r *Runner) execute(id string) {
 	_ = os.RemoveAll(dir)
 	if r.releaser == nil {
 		r.finish(id, store.DeploymentStatusSucceeded, tag, sha, "")
+		r.retain(id)
 		return
 	}
 	starting := store.DeploymentStatusStarting
@@ -355,6 +491,92 @@ func (r *Runner) execute(id string) {
 	if err != nil || got.Status != store.DeploymentStatusRunning {
 		r.log.Error("release did not mark running", "deployment", id, "err", err)
 		r.finish(id, store.DeploymentStatusFailed, tag, sha, msgInternal)
+		return
+	}
+	r.retain(id)
+}
+
+func (r *Runner) executeRollback(dep store.Deployment) {
+	id := dep.ID
+	started := r.now().UTC()
+	building := store.DeploymentStatusBuilding
+	if _, err := r.store.UpdateDeployment(context.Background(), id, store.DeploymentUpdate{
+		Status:    &building,
+		StartedAt: &started,
+	}); err != nil {
+		r.log.Error("mark building", "deployment", id, "err", err)
+		r.finish(id, store.DeploymentStatusFailed, dep.ImageTag, dep.CommitSHA, msgInternal)
+		return
+	}
+	logs := logWriter{store: r.store, id: id}
+	_, _ = fmt.Fprintf(&logs, "rolling back to %s from %s\n", dep.ImageTag, dep.RollbackOf)
+	if err := build.ValidateTag(dep.ImageTag); err != nil {
+		r.log.Error("rollback image", "deployment", id, "err", err)
+		r.finish(id, store.DeploymentStatusFailed, dep.ImageTag, dep.CommitSHA, msgInternal)
+		return
+	}
+	if r.releaser == nil {
+		r.finish(id, store.DeploymentStatusSucceeded, dep.ImageTag, dep.CommitSHA, "")
+		r.retain(id)
+		return
+	}
+	starting := store.DeploymentStatusStarting
+	image := dep.ImageTag
+	sha := dep.CommitSHA
+	if _, err := r.store.UpdateDeployment(context.Background(), id, store.DeploymentUpdate{
+		Status:    &starting,
+		ImageTag:  &image,
+		CommitSHA: &sha,
+	}); err != nil {
+		r.log.Error("mark starting", "deployment", id, "err", err)
+		r.finish(id, store.DeploymentStatusFailed, dep.ImageTag, dep.CommitSHA, msgInternal)
+		return
+	}
+	_, _ = fmt.Fprintf(&logs, "starting %s\n", dep.ImageTag)
+	if err := r.releaser.Release(r.ctx, dep.AppName, id, dep.ImageTag, &logs); err != nil {
+		_, _ = fmt.Fprintf(&logs, "error: %s\n", err.Error())
+		r.finish(id, store.DeploymentStatusFailed, dep.ImageTag, dep.CommitSHA, releaseFailure(r.ctx, err))
+		return
+	}
+	got, err := r.store.GetDeployment(context.Background(), id)
+	if err != nil || got.Status != store.DeploymentStatusRunning {
+		r.log.Error("rollback did not mark running", "deployment", id, "err", err)
+		r.finish(id, store.DeploymentStatusFailed, dep.ImageTag, dep.CommitSHA, msgInternal)
+		return
+	}
+	r.retain(id)
+}
+
+func (r *Runner) retain(id string) {
+	dropped, err := r.store.RecordRelease(context.Background(), id, r.releaseKeep)
+	if err != nil {
+		r.log.Error("record release", "deployment", id, "err", err)
+		return
+	}
+	if r.images == nil || len(dropped) == 0 {
+		return
+	}
+	dep, err := r.store.GetDeployment(context.Background(), id)
+	if err != nil {
+		r.log.Error("load release", "deployment", id, "err", err)
+		return
+	}
+	kept, err := r.store.ListReleases(context.Background(), dep.AppName)
+	if err != nil {
+		r.log.Error("list releases", "app", dep.AppName, "err", err)
+		return
+	}
+	inUse := make(map[string]bool, len(kept))
+	for _, rel := range kept {
+		inUse[rel.ImageTag] = true
+	}
+	for _, rel := range dropped {
+		if rel.ImageTag == "" || inUse[rel.ImageTag] {
+			continue
+		}
+		if err := r.images.RemoveImage(context.Background(), rel.ImageTag); err != nil {
+			r.log.Error("remove image", "image", rel.ImageTag, "err", err)
+		}
 	}
 }
 

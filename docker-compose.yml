@@ -10,13 +10,18 @@ services:
       - "8081:8081"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - shipyard-data:/data
     environment:
       SHIPYARD_ADDR: ":8080"
       SHIPYARD_PROXY_ADDR: ":8081"
       SHIPYARD_RUNTIME_NETWORK: shipyard
+      SHIPYARD_DB: /data/shipyard.db
     networks:
       - shipyard
 
 networks:
   shipyard:
     name: shipyard
+
+volumes:
+  shipyard-data:

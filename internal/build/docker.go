@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/proc"
@@ -48,6 +50,19 @@ func NewDocker() *Docker {
 
 // Build implements Builder.
 func (d *Docker) Build(ctx context.Context, contextDir, tag string, logs io.Writer) error {
+	return d.build(ctx, contextDir, tag, nil, logs)
+}
+
+// BuildWithArgs builds an image and passes build-args to docker.
+// Keys must be uppercase identifiers. Values cannot contain newlines.
+func (d *Docker) BuildWithArgs(ctx context.Context, contextDir, tag string, buildArgs map[string]string, logs io.Writer) error {
+	if err := validateBuildArgs(buildArgs); err != nil {
+		return err
+	}
+	return d.build(ctx, contextDir, tag, buildArgs, logs)
+}
+
+func (d *Docker) build(ctx context.Context, contextDir, tag string, buildArgs map[string]string, logs io.Writer) error {
 	if err := ValidateTag(tag); err != nil {
 		return err
 	}
@@ -60,13 +75,33 @@ func (d *Docker) Build(ctx context.Context, contextDir, tag string, logs io.Writ
 	if err := d.look(dockerBinary); err != nil {
 		return ErrDockerNotFound
 	}
-	args := []string{"build", "--progress=plain", "-t", tag, "--", contextDir}
+	args := []string{"build", "--progress=plain"}
+	keys := make([]string, 0, len(buildArgs))
+	for key := range buildArgs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, "--build-arg", key+"="+buildArgs[key])
+	}
+	args = append(args, "-t", tag, "--", contextDir)
 	spec := proc.Spec{
 		Env:    setEnv(os.Environ(), "DOCKER_BUILDKIT", "1"),
 		Stdout: logs,
 		Stderr: logs,
 	}
 	return d.run.Run(ctx, dockerBinary, args, spec)
+}
+
+var buildArgKey = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,31}$`)
+
+func validateBuildArgs(args map[string]string) error {
+	for key, value := range args {
+		if !buildArgKey.MatchString(key) || len(value) > 128 || strings.ContainsAny(value, "\x00\r\n") {
+			return ErrInvalidContext
+		}
+	}
+	return nil
 }
 
 func validateContext(dir string) error {

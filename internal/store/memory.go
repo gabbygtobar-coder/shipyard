@@ -15,15 +15,17 @@ const logPollInterval = 25 * time.Millisecond
 
 // Memory is an in-memory Store safe for concurrent use.
 type Memory struct {
-	mu       sync.Mutex
-	now      func() time.Time
-	apps     map[string]App
-	appOrder []string
-	deps     map[string]Deployment
-	depOrder []string
-	logs     map[string]*bytes.Buffer
-	logTrunc map[string]bool
-	nextDep  int
+	mu         sync.Mutex
+	now        func() time.Time
+	apps       map[string]App
+	appOrder   []string
+	deps       map[string]Deployment
+	depOrder   []string
+	logs       map[string]*bytes.Buffer
+	logTrunc   map[string]bool
+	releases   map[string][]Release
+	deliveries map[string]struct{}
+	nextDep    int
 }
 
 // NewMemory returns an empty in-memory store that timestamps with time.Now.
@@ -38,11 +40,13 @@ func NewMemoryWithClock(now func() time.Time) *Memory {
 		now = time.Now
 	}
 	return &Memory{
-		now:      now,
-		apps:     make(map[string]App),
-		deps:     make(map[string]Deployment),
-		logs:     make(map[string]*bytes.Buffer),
-		logTrunc: make(map[string]bool),
+		now:        now,
+		apps:       make(map[string]App),
+		deps:       make(map[string]Deployment),
+		logs:       make(map[string]*bytes.Buffer),
+		logTrunc:   make(map[string]bool),
+		releases:   make(map[string][]Release),
+		deliveries: make(map[string]struct{}),
 	}
 }
 
@@ -66,6 +70,7 @@ func (m *Memory) CreateApp(ctx context.Context, name, repoURL string) (App, erro
 	app := App{
 		Name:      name,
 		RepoURL:   repoURL,
+		Branch:    DefaultBranch,
 		Status:    AppStatusIdle,
 		CreatedAt: m.now().UTC(),
 	}
@@ -133,6 +138,53 @@ func (m *Memory) SetAppStatus(ctx context.Context, name, status, appURL string) 
 	app.URL = appURL
 	m.apps[name] = app
 	return app, nil
+}
+
+// ConfigureApp implements Store.
+func (m *Memory) ConfigureApp(ctx context.Context, name string, settings AppSettings) (App, error) {
+	if err := ctx.Err(); err != nil {
+		return App{}, err
+	}
+	name = strings.TrimSpace(name)
+	settings, err := normalizeSettings(settings)
+	if err != nil || name == "" {
+		return App{}, ErrInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	app, ok := m.apps[name]
+	if !ok {
+		return App{}, ErrNotFound
+	}
+	app.Branch = settings.Branch
+	app.AutoDeploy = settings.AutoDeploy
+	app.WebhookSecret = settings.WebhookSecret
+	m.apps[name] = app
+	return app, nil
+}
+
+// ListAppsByRepo implements Store.
+func (m *Memory) ListAppsByRepo(ctx context.Context, repoURL string) ([]App, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	canonical, err := giturl.NormalizeRepoURL(repoURL)
+	if err != nil {
+		return nil, ErrInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	apps := make([]App, 0)
+	for _, name := range m.appOrder {
+		if m.apps[name].RepoURL == canonical {
+			apps = append(apps, m.apps[name])
+		}
+	}
+	return apps, nil
 }
 
 // CreateDeployment implements Store.
@@ -205,17 +257,9 @@ func (m *Memory) UpdateDeployment(ctx context.Context, id string, upd Deployment
 	if id == "" {
 		return Deployment{}, ErrInvalid
 	}
-	if upd.Ref != nil {
-		if err := giturl.ValidateRef(strings.TrimSpace(*upd.Ref)); err != nil {
-			return Deployment{}, ErrInvalid
-		}
-	}
-	if upd.Error != nil && len(*upd.Error) > 4096 {
-		trimmed := (*upd.Error)[:4096]
-		upd.Error = &trimmed
-	}
-	if upd.URL != nil && len(strings.TrimSpace(*upd.URL)) > 2048 {
-		return Deployment{}, ErrInvalid
+	upd, err := prepareDeploymentUpdate(upd)
+	if err != nil {
+		return Deployment{}, err
 	}
 
 	m.mu.Lock()
@@ -225,56 +269,12 @@ func (m *Memory) UpdateDeployment(ctx context.Context, id string, upd Deployment
 	if !ok {
 		return Deployment{}, ErrNotFound
 	}
-	nextStatus := dep.Status
-	statusChange := false
-	if upd.Status != nil {
-		nextStatus = strings.TrimSpace(*upd.Status)
-		if nextStatus != dep.Status {
-			statusChange = true
-			if !validDeploymentStatus(nextStatus) || !CanTransition(dep.Status, nextStatus) {
-				return Deployment{}, ErrInvalid
-			}
-		}
+	next, err := applyDeploymentUpdate(dep, upd)
+	if err != nil {
+		return Deployment{}, err
 	}
-	if !mutableDeployment(dep.Status) {
-		if !statusChange {
-			if deploymentUpdateChanges(dep, upd) {
-				return Deployment{}, ErrInvalid
-			}
-			return cloneDeployment(dep), nil
-		}
-		if deploymentFieldsChange(dep, upd) {
-			return Deployment{}, ErrInvalid
-		}
-	}
-	if statusChange {
-		dep.Status = nextStatus
-	}
-	if upd.Ref != nil {
-		dep.Ref = strings.TrimSpace(*upd.Ref)
-	}
-	if upd.CommitSHA != nil {
-		dep.CommitSHA = strings.TrimSpace(*upd.CommitSHA)
-	}
-	if upd.ImageTag != nil {
-		dep.ImageTag = strings.TrimSpace(*upd.ImageTag)
-	}
-	if upd.URL != nil {
-		dep.URL = strings.TrimSpace(*upd.URL)
-	}
-	if upd.Error != nil {
-		dep.Error = strings.TrimSpace(*upd.Error)
-	}
-	if upd.StartedAt != nil {
-		t := upd.StartedAt.UTC()
-		dep.StartedAt = &t
-	}
-	if upd.FinishedAt != nil {
-		t := upd.FinishedAt.UTC()
-		dep.FinishedAt = &t
-	}
-	m.deps[id] = dep
-	return cloneDeployment(dep), nil
+	m.deps[id] = next
+	return cloneDeployment(next), nil
 }
 
 // GetDeployment implements Store.
@@ -420,6 +420,199 @@ func (m *Memory) WaitDeploymentLog(ctx context.Context, id string, offset int) e
 	}
 }
 
+// ClaimDelivery implements Store.
+func (m *Memory) ClaimDelivery(ctx context.Context, id string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	id = strings.TrimSpace(id)
+	if !validDeliveryID(id) {
+		return false, ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.deliveries[id]; ok {
+		return false, nil
+	}
+	m.deliveries[id] = struct{}{}
+	return true, nil
+}
+
+// ForgetDelivery implements Store.
+func (m *Memory) ForgetDelivery(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	id = strings.TrimSpace(id)
+	if !validDeliveryID(id) {
+		return ErrInvalid
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.deliveries, id)
+	return nil
+}
+
+// CreateRollback implements Store.
+func (m *Memory) CreateRollback(ctx context.Context, appName string, source Release) (Deployment, error) {
+	if err := ctx.Err(); err != nil {
+		return Deployment{}, err
+	}
+	appName = strings.TrimSpace(appName)
+	source, err := normalizeRelease(appName, source)
+	if err != nil {
+		return Deployment{}, err
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dep, err := m.appendDeployment(appName, DeploymentStatusQueued, source.Ref)
+	if err != nil {
+		return Deployment{}, err
+	}
+	dep.CommitSHA = source.CommitSHA
+	dep.ImageTag = source.ImageTag
+	dep.RollbackOf = source.DeploymentID
+	m.deps[dep.ID] = dep
+	return cloneDeployment(dep), nil
+}
+
+// RecordRelease implements Store.
+func (m *Memory) RecordRelease(ctx context.Context, deploymentID string, keep int) ([]Release, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	deploymentID = strings.TrimSpace(deploymentID)
+	if deploymentID == "" || keep < 1 {
+		return nil, ErrInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	dep, ok := m.deps[deploymentID]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if !releasable(dep) {
+		return nil, ErrInvalid
+	}
+	list := m.releases[dep.AppName]
+	for _, rel := range list {
+		if rel.DeploymentID == dep.ID {
+			return nil, nil
+		}
+	}
+	list = append(list, Release{
+		AppName:      dep.AppName,
+		DeploymentID: dep.ID,
+		Ref:          dep.Ref,
+		CommitSHA:    dep.CommitSHA,
+		ImageTag:     dep.ImageTag,
+		CreatedAt:    m.now().UTC(),
+	})
+	var dropped []Release
+	if len(list) > keep {
+		dropped = append([]Release(nil), list[:len(list)-keep]...)
+		list = append([]Release(nil), list[len(list)-keep:]...)
+	}
+	m.releases[dep.AppName] = list
+	return dropped, nil
+}
+
+// ListReleases implements Store.
+func (m *Memory) ListReleases(ctx context.Context, appName string) ([]Release, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	appName = strings.TrimSpace(appName)
+	if appName == "" {
+		return nil, ErrInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if _, ok := m.apps[appName]; !ok {
+		return nil, ErrNotFound
+	}
+	list := m.releases[appName]
+	out := make([]Release, 0, len(list))
+	for i := len(list) - 1; i >= 0; i-- {
+		out = append(out, list[i])
+	}
+	return out, nil
+}
+
+func prepareDeploymentUpdate(upd DeploymentUpdate) (DeploymentUpdate, error) {
+	if upd.Ref != nil {
+		if err := giturl.ValidateRef(strings.TrimSpace(*upd.Ref)); err != nil {
+			return DeploymentUpdate{}, ErrInvalid
+		}
+	}
+	if upd.Error != nil && len(*upd.Error) > 4096 {
+		trimmed := (*upd.Error)[:4096]
+		upd.Error = &trimmed
+	}
+	if upd.URL != nil && len(strings.TrimSpace(*upd.URL)) > 2048 {
+		return DeploymentUpdate{}, ErrInvalid
+	}
+	return upd, nil
+}
+
+func applyDeploymentUpdate(dep Deployment, upd DeploymentUpdate) (Deployment, error) {
+	nextStatus := dep.Status
+	statusChange := false
+	if upd.Status != nil {
+		nextStatus = strings.TrimSpace(*upd.Status)
+		if nextStatus != dep.Status {
+			statusChange = true
+			if !validDeploymentStatus(nextStatus) || !CanTransition(dep.Status, nextStatus) {
+				return Deployment{}, ErrInvalid
+			}
+		}
+	}
+	if !mutableDeployment(dep.Status) {
+		if !statusChange {
+			if deploymentUpdateChanges(dep, upd) {
+				return Deployment{}, ErrInvalid
+			}
+			return cloneDeployment(dep), nil
+		}
+		if deploymentFieldsChange(dep, upd) {
+			return Deployment{}, ErrInvalid
+		}
+	}
+	if statusChange {
+		dep.Status = nextStatus
+	}
+	if upd.Ref != nil {
+		dep.Ref = strings.TrimSpace(*upd.Ref)
+	}
+	if upd.CommitSHA != nil {
+		dep.CommitSHA = strings.TrimSpace(*upd.CommitSHA)
+	}
+	if upd.ImageTag != nil {
+		dep.ImageTag = strings.TrimSpace(*upd.ImageTag)
+	}
+	if upd.URL != nil {
+		dep.URL = strings.TrimSpace(*upd.URL)
+	}
+	if upd.Error != nil {
+		dep.Error = strings.TrimSpace(*upd.Error)
+	}
+	if upd.StartedAt != nil {
+		t := upd.StartedAt.UTC()
+		dep.StartedAt = &t
+	}
+	if upd.FinishedAt != nil {
+		t := upd.FinishedAt.UTC()
+		dep.FinishedAt = &t
+	}
+	return dep, nil
+}
+
 func deploymentUpdateChanges(dep Deployment, upd DeploymentUpdate) bool {
 	if upd.Status != nil && strings.TrimSpace(*upd.Status) != dep.Status {
 		return true
@@ -482,6 +675,90 @@ func cloneDeployment(dep Deployment) Deployment {
 		dep.FinishedAt = &t
 	}
 	return dep
+}
+
+func normalizeSettings(settings AppSettings) (AppSettings, error) {
+	branch, err := normalizeBranch(settings.Branch)
+	if err != nil {
+		return AppSettings{}, err
+	}
+	if !validWebhookSecret(settings.WebhookSecret) {
+		return AppSettings{}, ErrInvalid
+	}
+	settings.Branch = branch
+	return settings, nil
+}
+
+func normalizeBranch(branch string) (string, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		branch = DefaultBranch
+	}
+	if err := giturl.ValidateRef(branch); err != nil {
+		return "", ErrInvalid
+	}
+	return branch, nil
+}
+
+func validWebhookSecret(secret string) bool {
+	if len(secret) > MaxWebhookSecretBytes || strings.ContainsRune(secret, 0) {
+		return false
+	}
+	return true
+}
+
+func validDeliveryID(id string) bool {
+	if id == "" || len(id) > MaxDeliveryIDBytes {
+		return false
+	}
+	for _, r := range id {
+		switch {
+		case r >= 'a' && r <= 'z':
+		case r >= 'A' && r <= 'Z':
+		case r >= '0' && r <= '9':
+		case r == '-' || r == '_':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeRelease(appName string, source Release) (Release, error) {
+	source.AppName = strings.TrimSpace(source.AppName)
+	source.DeploymentID = strings.TrimSpace(source.DeploymentID)
+	source.Ref = strings.TrimSpace(source.Ref)
+	source.CommitSHA = strings.TrimSpace(source.CommitSHA)
+	source.ImageTag = strings.TrimSpace(source.ImageTag)
+	if appName == "" || source.DeploymentID == "" || source.ImageTag == "" {
+		return Release{}, ErrInvalid
+	}
+	if source.AppName != "" && source.AppName != appName {
+		return Release{}, ErrInvalid
+	}
+	if err := giturl.ValidateRef(source.Ref); err != nil {
+		return Release{}, ErrInvalid
+	}
+	if source.CommitSHA != "" && !giturl.ValidSHA(source.CommitSHA) {
+		return Release{}, ErrInvalid
+	}
+	if strings.ContainsAny(source.ImageTag, " \t\r\n") || len(source.ImageTag) > 256 {
+		return Release{}, ErrInvalid
+	}
+	source.AppName = appName
+	return source, nil
+}
+
+func releasable(dep Deployment) bool {
+	if dep.ImageTag == "" || strings.ContainsAny(dep.ImageTag, " \t\r\n") {
+		return false
+	}
+	switch dep.Status {
+	case DeploymentStatusRunning, DeploymentStatusSucceeded:
+		return true
+	default:
+		return false
+	}
 }
 
 func validDeploymentStatus(status string) bool {

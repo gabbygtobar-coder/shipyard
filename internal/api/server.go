@@ -18,6 +18,7 @@ import (
 
 const (
 	contentTypeJSON = "application/json; charset=utf-8"
+	mediaTypeJSON   = "application/json"
 	maxBodyBytes    = 1 << 20
 
 	errAppNotFound  = "app not found"
@@ -27,6 +28,7 @@ const (
 	errBodyRequired = "request body is required"
 	errBodyTooLarge = "request body too large"
 	errContentType  = "content type must be application/json"
+	errMultipleJSON = "multiple JSON values"
 	errCanceled     = "request canceled"
 
 	errDeploymentNotFound  = "deployment not found"
@@ -42,10 +44,22 @@ type AppRuntime interface {
 
 // handler serves the shipyard HTTP API.
 type handler struct {
-	store  store.Store
-	builds deploy.BuildService
-	run    AppRuntime
-	log    *slog.Logger
+	store         store.Store
+	builds        deploy.BuildService
+	run           AppRuntime
+	log           *slog.Logger
+	webhookSecret string
+}
+
+// Option configures the HTTP API.
+type Option func(*handler)
+
+// WithWebhookSecret sets the global GitHub webhook HMAC secret.
+// The secret is not logged.
+func WithWebhookSecret(secret string) Option {
+	return func(h *handler) {
+		h.webhookSecret = secret
+	}
 }
 
 // NewHandler returns the shipyard HTTP API.
@@ -53,17 +67,26 @@ type handler struct {
 // returns 503 and the read routes still serve records already in st.
 // run may be nil, in which case stop returns 503.
 // A nil logger discards log output.
-func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger, run AppRuntime) http.Handler {
+func NewHandler(st store.Store, builds deploy.BuildService, logger *slog.Logger, run AppRuntime, opts ...Option) http.Handler {
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	h := &handler{store: st, builds: builds, run: run, log: logger}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(h)
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
+	mux.HandleFunc("POST /webhooks/github", h.githubWebhook)
 	mux.HandleFunc("POST /apps", h.createApp)
 	mux.HandleFunc("GET /apps", h.listApps)
+	mux.HandleFunc("PATCH /apps/{name}", h.updateApp)
 	mux.HandleFunc("GET /apps/{name}/url", h.appURL)
 	mux.HandleFunc("POST /apps/{name}/stop", h.stopApp)
+	mux.HandleFunc("POST /apps/{name}/rollback", h.rollbackApp)
+	mux.HandleFunc("GET /apps/{name}/releases", h.listReleases)
 	mux.HandleFunc("GET /apps/{name}", h.getApp)
 	mux.HandleFunc("POST /apps/{name}/deployments", h.createDeployment)
 	mux.HandleFunc("GET /apps/{name}/deployments", h.listDeployments)

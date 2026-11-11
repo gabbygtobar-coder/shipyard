@@ -169,7 +169,7 @@ func decodeDeploymentRef(w http.ResponseWriter, r *http.Request) (string, error)
 		return "", nil
 	}
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
+	if err != nil || mediaType != mediaTypeJSON {
 		return "", &httpStatusError{status: http.StatusUnsupportedMediaType, msg: errContentType}
 	}
 	dec := json.NewDecoder(bytes.NewReader(data))
@@ -183,7 +183,7 @@ func decodeDeploymentRef(w http.ResponseWriter, r *http.Request) (string, error)
 		return strings.TrimSpace(req.Ref), nil
 	}
 	if trailing == nil {
-		return "", errors.New("multiple JSON values")
+		return "", errors.New(errMultipleJSON)
 	}
 	return "", classifyDecodeError(trailing)
 }

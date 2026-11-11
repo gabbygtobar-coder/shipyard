@@ -42,13 +42,70 @@ func newAPIClient(baseURL string) *apiClient {
 	}
 }
 
-func (c *apiClient) createApp(ctx context.Context, name, repoURL string) (store.App, error) {
+func (c *apiClient) createApp(ctx context.Context, name, repoURL, branch string, auto bool, secret string) (store.App, error) {
 	var app store.App
-	body := map[string]string{"name": name, "repo_url": repoURL}
+	body := map[string]any{"name": name, "repo_url": repoURL}
+	if branch != "" {
+		body["branch"] = branch
+	}
+	if auto {
+		body["auto_deploy"] = true
+	}
+	if secret != "" {
+		body["webhook_secret"] = secret
+	}
 	if err := c.do(ctx, http.MethodPost, "/apps", body, &app); err != nil {
 		return store.App{}, err
 	}
 	return app, nil
+}
+
+func (c *apiClient) updateApp(ctx context.Context, name string, branchSet bool, branch string, auto *bool, secretSet bool, secret string) (store.App, error) {
+	var app store.App
+	body := map[string]any{}
+	if branchSet {
+		body["branch"] = branch
+	}
+	if auto != nil {
+		body["auto_deploy"] = *auto
+	}
+	if secretSet {
+		body["webhook_secret"] = secret
+	}
+	path := "/apps/" + url.PathEscape(name)
+	if err := c.do(ctx, http.MethodPatch, path, body, &app); err != nil {
+		return store.App{}, err
+	}
+	return app, nil
+}
+
+func (c *apiClient) rollback(ctx context.Context, name, deploymentID string) (store.Deployment, error) {
+	var dep store.Deployment
+	body := map[string]string{}
+	if deploymentID != "" {
+		body["deployment_id"] = deploymentID
+	}
+	path := "/apps/" + url.PathEscape(name) + "/rollback"
+	if err := c.do(ctx, http.MethodPost, path, body, &dep); err != nil {
+		return store.Deployment{}, err
+	}
+	return dep, nil
+}
+
+type releaseListResponse struct {
+	Releases []store.Release `json:"releases"`
+}
+
+func (c *apiClient) releases(ctx context.Context, name string) (releaseListResponse, error) {
+	var out releaseListResponse
+	path := "/apps/" + url.PathEscape(name) + "/releases"
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return releaseListResponse{}, err
+	}
+	if out.Releases == nil {
+		out.Releases = []store.Release{}
+	}
+	return out, nil
 }
 
 func (c *apiClient) listApps(ctx context.Context) (appListResponse, error) {

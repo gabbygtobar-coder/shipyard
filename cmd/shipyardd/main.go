@@ -64,6 +64,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	healthTimeout := fs.Duration("health-timeout", flagDefaults.HealthTimeout, "health gate time limit (env "+config.EnvHealthTimeout+")")
 	healthInterval := fs.Duration("health-interval", flagDefaults.HealthInterval, "delay between health probes (env "+config.EnvHealthInterval+")")
 	network := fs.String("runtime-network", flagDefaults.RuntimeNetwork, "docker network for app containers; empty publishes on 127.0.0.1 (env "+config.EnvRuntimeNetwork+")")
+	dbPath := fs.String("db", flagDefaults.DBPath, "sqlite database file, or memory (env "+config.EnvDB+")")
+	releaseHistory := fs.Int("release-history", flagDefaults.ReleaseHistory, "successful images kept per app (env "+config.EnvReleaseHistory+")")
 	fs.Usage = func() {
 		fprintf(fs.Output(), "Usage: shipyardd [--addr %s] [--proxy-addr %s]\n", config.DefaultAddr, config.DefaultProxyAddr)
 		fs.PrintDefaults()
@@ -98,13 +100,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 		HealthTimeout:    *healthTimeout,
 		HealthInterval:   *healthInterval,
 		RuntimeNetwork:   *network,
+		DBPath:           *dbPath,
+		ReleaseHistory:   *releaseHistory,
+		WebhookSecret:    loaded.WebhookSecret,
 	}
 	if err := cfg.Check(); err != nil {
 		fprintf(stderr, "config: %s\n", err)
 		return 2
 	}
 
-	st := store.NewMemory()
+	st, closeStore, err := openStore(cfg.DBPath)
+	if err != nil {
+		logger.Error("database", "err", err)
+		return 1
+	}
+	defer closeStore()
+	if err := runtime.ReconcileLocalRuntime(context.Background(), st); err != nil {
+		logger.Error("reconcile", "err", err)
+		return 1
+	}
 	dockerRT := runtime.NewDocker()
 	reapCtx, reapCancel := context.WithTimeout(context.Background(), 20*time.Second)
 	if err := dockerRT.StopManaged(reapCtx); err != nil && !errors.Is(err, runtime.ErrDockerNotFound) {
@@ -140,15 +154,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	runner, err := deploy.New(deploy.Config{
-		Store:        st,
-		Cloner:       source.NewGit(cfg.CloneMaxBytes),
-		Builder:      build.NewDocker(),
-		Releaser:     supervisor,
-		Concurrency:  cfg.BuildConcurrency,
-		QueueSize:    cfg.BuildQueueSize,
-		BuildTimeout: cfg.BuildTimeout,
-		CloneTimeout: cfg.CloneTimeout,
-		Logger:       logger,
+		Store:          st,
+		Cloner:         source.NewGit(cfg.CloneMaxBytes),
+		Builder:        build.NewDocker(),
+		Releaser:       supervisor,
+		Concurrency:    cfg.BuildConcurrency,
+		QueueSize:      cfg.BuildQueueSize,
+		BuildTimeout:   cfg.BuildTimeout,
+		CloneTimeout:   cfg.CloneTimeout,
+		ReleaseHistory: cfg.ReleaseHistory,
+		Images:         dockerRT,
+		Logger:         logger,
 	})
 	if err != nil {
 		logger.Error("build runner", "err", err)
@@ -165,7 +181,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           api.NewHandler(st, runner, logger, supervisor),
+		Handler:           api.NewHandler(st, runner, logger, supervisor, api.WithWebhookSecret(cfg.WebhookSecret)),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       readTimeout,
 		WriteTimeout:      writeTimeout,
@@ -182,7 +198,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	errCh := make(chan error, 2)
 	go func() {
-		logger.Info("listening", "addr", cfg.Addr, "proxy_addr", cfg.ProxyAddr, "build_concurrency", cfg.BuildConcurrency)
+		logger.Info("listening",
+			"addr", cfg.Addr,
+			"proxy_addr", cfg.ProxyAddr,
+			"build_concurrency", cfg.BuildConcurrency,
+			"db", cfg.DBPath,
+			"webhook", cfg.WebhookSecret != "",
+		)
 		errCh <- srv.ListenAndServe()
 	}()
 	go func() {
@@ -214,6 +236,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return shutdown()
 	}
 	return 0
+}
+
+func openStore(path string) (store.Store, func(), error) {
+	if path == config.MemoryDBPath {
+		return store.NewMemory(), func() {}, nil
+	}
+	db, err := store.Open(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	return db, func() { _ = db.Close() }, nil
 }
 
 func fprintf(w io.Writer, format string, args ...any) {

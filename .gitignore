@@ -27,3 +27,8 @@ go.work.sum
 # Local env
 .env
 .env.*
+
+# Durable store
+*.db
+*.db-wal
+*.db-shm

@@ -23,6 +23,9 @@ func clearConfigEnv(t *testing.T) {
 		EnvHealthTimeout,
 		EnvHealthInterval,
 		EnvRuntimeNetwork,
+		EnvDB,
+		EnvReleaseHistory,
+		EnvWebhookSecret,
 	} {
 		t.Setenv(key, "")
 	}
@@ -58,6 +61,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.RuntimeNetwork != "" {
 		t.Fatalf("network %q", cfg.RuntimeNetwork)
 	}
+	if cfg.DBPath != DefaultDBPath || cfg.ReleaseHistory != DefaultReleaseHistory || cfg.WebhookSecret != "" {
+		t.Fatalf("store %#v", cfg)
+	}
 }
 
 func TestLoadFromEnv(t *testing.T) {
@@ -76,6 +82,9 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv(EnvHealthTimeout, "20s")
 	t.Setenv(EnvHealthInterval, "250ms")
 	t.Setenv(EnvRuntimeNetwork, "shipyard")
+	t.Setenv(EnvDB, "data/shipyard.db")
+	t.Setenv(EnvReleaseHistory, "8")
+	t.Setenv(EnvWebhookSecret, "global-secret")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -103,6 +112,9 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if cfg.RuntimeNetwork != "shipyard" {
 		t.Fatalf("network %q", cfg.RuntimeNetwork)
+	}
+	if cfg.DBPath != "data/shipyard.db" || cfg.ReleaseHistory != 8 || cfg.WebhookSecret != "global-secret" {
+		t.Fatalf("store path %q history %d", cfg.DBPath, cfg.ReleaseHistory)
 	}
 }
 
@@ -136,6 +148,8 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{key: EnvHealthTimeout, value: "1ms"},
 		{key: EnvProxyAddr, value: "8081"},
 		{key: EnvRuntimeNetwork, value: "-bad"},
+		{key: EnvReleaseHistory, value: "0"},
+		{key: EnvDB, value: "-bad"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+"="+tc.value, func(t *testing.T) {

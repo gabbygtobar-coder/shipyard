@@ -21,12 +21,15 @@ const (
 	usageText      = `Shipyard registers applications, builds images, and routes traffic to them.
 
 Usage:
-  shipyard [--api-url URL] apps create --name NAME --repo URL
+  shipyard [--api-url URL] apps create --name NAME --repo URL [--branch BRANCH] [--auto-deploy] [--webhook-secret SECRET]
+  shipyard [--api-url URL] apps update NAME [--branch BRANCH] [--auto-deploy true|false] [--webhook-secret SECRET]
   shipyard [--api-url URL] apps list
   shipyard [--api-url URL] apps get NAME
   shipyard [--api-url URL] apps url NAME
   shipyard [--api-url URL] deploy APP [--ref REF]
   shipyard [--api-url URL] deployments list APP
+  shipyard [--api-url URL] releases APP
+  shipyard [--api-url URL] rollback APP [--to DEPLOYMENT_ID]
   shipyard [--api-url URL] logs DEPLOYMENT_ID [--follow]
   shipyard [--api-url URL] stop APP
 
@@ -34,6 +37,7 @@ The API base URL is taken from --api-url, then SHIPYARD_API_URL,
 then http://127.0.0.1:8080. An empty --ref builds the repository default branch.
 logs --follow streams until the build finishes and exits 1 when it fails.
 apps url prints the public URL. stop ends the container that is receiving traffic.
+rollback redeploys a retained image. releases lists the images kept for rollback.
 
 `
 )
@@ -84,6 +88,10 @@ func run(args []string, getenv func(string) string, stdout, stderr io.Writer) in
 		return runLogs(rest[1:], client, stdout, stderr)
 	case "stop":
 		return runStop(rest[1:], client, stdout, stderr)
+	case "rollback":
+		return runRollback(rest[1:], client, stdout, stderr)
+	case "releases":
+		return runReleases(rest[1:], client, stdout, stderr)
 	default:
 		fprintf(stderr, "unknown command %q\n\n", rest[0])
 		fs.Usage()
@@ -99,6 +107,8 @@ func runApps(args []string, client *apiClient, stdout, stderr io.Writer) int {
 	switch args[0] {
 	case "create":
 		return runAppsCreate(args[1:], client, stdout, stderr)
+	case "update":
+		return runAppsUpdate(args[1:], client, stdout, stderr)
 	case "list":
 		return runAppsList(args[1:], client, stdout, stderr)
 	case "get":
@@ -116,8 +126,11 @@ func runAppsCreate(args []string, client *apiClient, stdout, stderr io.Writer) i
 	fs.SetOutput(stderr)
 	name := fs.String("name", "", "application name")
 	repo := fs.String("repo", "", "https GitHub repository URL")
+	branch := fs.String("branch", "", "branch that push events deploy (default main)")
+	auto := fs.Bool("auto-deploy", false, "deploy when that branch is pushed")
+	secret := fs.String("webhook-secret", "", "per-app GitHub webhook secret")
 	fs.Usage = func() {
-		fprintln(fs.Output(), "usage: shipyard apps create --name NAME --repo URL")
+		fprintln(fs.Output(), "usage: shipyard apps create --name NAME --repo URL [--branch BRANCH] [--auto-deploy] [--webhook-secret SECRET]")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -133,11 +146,82 @@ func runAppsCreate(args []string, client *apiClient, stdout, stderr io.Writer) i
 
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
-	app, err := client.createApp(ctx, strings.TrimSpace(*name), strings.TrimSpace(*repo))
+	app, err := client.createApp(ctx, strings.TrimSpace(*name), strings.TrimSpace(*repo), strings.TrimSpace(*branch), *auto, *secret)
 	if err != nil {
 		return writeCLIError(stderr, err)
 	}
 	return writeJSON(stdout, stderr, app)
+}
+
+func runAppsUpdate(args []string, client *apiClient, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("apps update", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	branch := fs.String("branch", "", "branch that push events deploy")
+	auto := fs.String("auto-deploy", "", "true or false")
+	secret := fs.String("webhook-secret", "", "per-app GitHub webhook secret; empty clears it when the flag is set")
+	fs.Usage = func() {
+		fprintln(fs.Output(), "usage: shipyard apps update NAME [--branch BRANCH] [--auto-deploy true|false] [--webhook-secret SECRET]")
+		fs.PrintDefaults()
+	}
+	name, flagArgs := splitLeadingArg(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if name == "" && fs.NArg() == 1 {
+		name = fs.Arg(0)
+	} else if name != "" && fs.NArg() != 0 {
+		fs.Usage()
+		return 2
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		fs.Usage()
+		return 2
+	}
+	var autoValue *bool
+	branchSet := false
+	secretSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "branch" {
+			branchSet = true
+		}
+		if f.Name == "webhook-secret" {
+			secretSet = true
+		}
+	})
+	if strings.TrimSpace(*auto) != "" {
+		parsed, err := parseBoolFlag(*auto)
+		if err != nil {
+			fprintln(stderr, "auto-deploy must be true or false")
+			return 2
+		}
+		autoValue = &parsed
+	}
+	if !branchSet && autoValue == nil && !secretSet {
+		fs.Usage()
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	app, err := client.updateApp(ctx, name, branchSet, strings.TrimSpace(*branch), autoValue, secretSet, *secret)
+	if err != nil {
+		return writeCLIError(stderr, err)
+	}
+	return writeJSON(stdout, stderr, app)
+}
+
+func parseBoolFlag(raw string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true", "1", "yes":
+		return true, nil
+	case "false", "0", "no":
+		return false, nil
+	default:
+		return false, errors.New("invalid bool")
+	}
 }
 
 func runAppsList(args []string, client *apiClient, stdout, stderr io.Writer) int {
@@ -216,6 +300,74 @@ func runAppsURL(args []string, client *apiClient, stdout, stderr io.Writer) int 
 	}
 	fprintf(stdout, "%s\n", appURL)
 	return 0
+}
+
+func runRollback(args []string, client *apiClient, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	to := fs.String("to", "", "deployment id to redeploy")
+	fs.Usage = func() {
+		fprintln(fs.Output(), "usage: shipyard rollback APP [--to DEPLOYMENT_ID]")
+		fs.PrintDefaults()
+	}
+	app, flagArgs := splitLeadingArg(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if app == "" && fs.NArg() == 1 {
+		app = fs.Arg(0)
+	} else if app != "" && fs.NArg() != 0 {
+		fs.Usage()
+		return 2
+	}
+	app = strings.TrimSpace(app)
+	if app == "" {
+		fs.Usage()
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	dep, err := client.rollback(ctx, app, strings.TrimSpace(*to))
+	if err != nil {
+		return writeCLIError(stderr, err)
+	}
+	return writeJSON(stdout, stderr, dep)
+}
+
+func runReleases(args []string, client *apiClient, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("releases", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	fs.Usage = func() {
+		fprintln(fs.Output(), "usage: shipyard releases APP")
+	}
+	app, flagArgs := splitLeadingArg(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if app == "" && fs.NArg() == 1 {
+		app = fs.Arg(0)
+	} else if app != "" && fs.NArg() != 0 {
+		fs.Usage()
+		return 2
+	}
+	app = strings.TrimSpace(app)
+	if app == "" {
+		fs.Usage()
+		return 2
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	list, err := client.releases(ctx, app)
+	if err != nil {
+		return writeCLIError(stderr, err)
+	}
+	return writeJSON(stdout, stderr, list)
 }
 
 func runStop(args []string, client *apiClient, stdout, stderr io.Writer) int {

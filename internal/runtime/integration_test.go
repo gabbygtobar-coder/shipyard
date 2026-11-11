@@ -1,4 +1,4 @@
-package runtime
+package runtime_test
 
 import (
 	"context"
@@ -13,9 +13,12 @@ import (
 	"time"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/build"
+	"github.com/gabbygtobar-coder/shipyard/internal/deploy"
 	"github.com/gabbygtobar-coder/shipyard/internal/proc"
 	"github.com/gabbygtobar-coder/shipyard/internal/proxy"
 	"github.com/gabbygtobar-coder/shipyard/internal/route"
+	"github.com/gabbygtobar-coder/shipyard/internal/runtime"
+	"github.com/gabbygtobar-coder/shipyard/internal/source"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
 
@@ -41,46 +44,34 @@ func TestIntegrationHello(t *testing.T) {
 	}
 
 	const (
-		tag  = "shipyard/hello:0123456789ab"
-		name = "shipyard-hello-dep_1"
+		tagV1 = "shipyard/hello:111111111111"
+		tagV2 = "shipyard/hello:222222222222"
 	)
+	names := []string{"shipyard-hello-dep_1", "shipyard-hello-dep_2", "shipyard-hello-dep_3", "shipyard-hello-dep_4"}
 	cleanup := func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = proc.Run(ctx, "docker", []string{"rm", "-f", name}, proc.Spec{})
-		_ = proc.Run(ctx, "docker", []string{"rmi", "-f", tag}, proc.Spec{})
+		args := append([]string{"rm", "-f"}, names...)
+		_ = proc.Run(ctx, "docker", args, proc.Spec{})
+		_ = proc.Run(ctx, "docker", []string{"rmi", "-f", tagV1, tagV2}, proc.Spec{})
 	}
 	cleanup()
 	t.Cleanup(cleanup)
 
-	buildCtx, buildCancel := context.WithTimeout(context.Background(), 4*time.Minute)
-	defer buildCancel()
-	var buildLogs strings.Builder
-	if err := build.NewDocker().Build(buildCtx, abs, tag, &buildLogs); err != nil {
-		t.Fatalf("build: %v\n%s", err, buildLogs.String())
-	}
-	if buildLogs.Len() == 0 {
-		t.Fatal("docker build produced no log output")
-	}
+	buildHello(t, abs, tagV1, "v1")
+	buildHello(t, abs, tagV2, "v2")
 
 	st := store.NewMemory()
 	if _, err := st.CreateApp(context.Background(), "hello", "https://github.com/acme/hello"); err != nil {
 		t.Fatal(err)
 	}
-	dep, err := st.CreateDeployment(context.Background(), "hello", store.DeploymentStatusStarting)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dep.ID != "dep_1" {
-		t.Fatalf("deployment id %s", dep.ID)
-	}
 	routes := route.NewTable()
-	sup, err := NewSupervisor(SupervisorConfig{
+	sup, err := runtime.NewSupervisor(runtime.SupervisorConfig{
 		Store:         st,
-		Runtime:       NewDocker(),
-		Checker:       HTTPChecker{Path: "/", Interval: 200 * time.Millisecond},
+		Runtime:       runtime.NewDocker(),
+		Checker:       runtime.HTTPChecker{Path: "/", Interval: 200 * time.Millisecond},
 		Routes:        routes,
-		Port:          DefaultContainerPort,
+		Port:          runtime.DefaultContainerPort,
 		MemoryBytes:   256 << 20,
 		CPUMilli:      500,
 		HealthTimeout: 45 * time.Second,
@@ -95,19 +86,51 @@ func TestIntegrationHello(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
-	defer releaseCancel()
-	var runLogs strings.Builder
-	if err := sup.Release(releaseCtx, "hello", dep.ID, tag, &runLogs); err != nil {
-		logCtx, logCancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer logCancel()
-		out, _ := proc.Output(logCtx, "docker", []string{"logs", name}, proc.Spec{})
-		t.Fatalf("release: %v\n%s\ncontainer logs:\n%s", err, runLogs.String(), out)
+	handler := proxy.New(routes, nil)
+	first := releaseHello(t, st, sup, tagV1)
+	if first.ID != "dep_1" {
+		t.Fatalf("deployment id %s", first.ID)
+	}
+	assertProxy(t, handler, "http://hello.localhost/", "hello.localhost", "hello from shipyard")
+	assertProxy(t, handler, "http://hello.localhost/", "hello.localhost", "version v1")
+	assertProxy(t, handler, "http://127.0.0.1:8081/apps/hello/", "127.0.0.1:8081", "version v1")
+	if _, err := st.RecordRelease(context.Background(), first.ID, 5); err != nil {
+		t.Fatal(err)
 	}
 
-	handler := proxy.New(routes, nil)
-	assertProxy(t, handler, "http://hello.localhost/", "hello.localhost", "hello from shipyard")
-	assertProxy(t, handler, "http://127.0.0.1:8081/apps/hello/", "127.0.0.1:8081", "hello from shipyard")
+	second := releaseHello(t, st, sup, tagV2)
+	assertProxy(t, handler, "http://hello.localhost/", "hello.localhost", "version v2")
+	if _, err := st.RecordRelease(context.Background(), second.ID, 5); err != nil {
+		t.Fatal(err)
+	}
+
+	runner, err := deploy.New(deploy.Config{
+		Store:          st,
+		Cloner:         &source.Fake{},
+		Builder:        &build.Fake{},
+		Releaser:       sup,
+		ReleaseHistory: 5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	if err := runner.Start(runCtx); err != nil {
+		t.Fatal(err)
+	}
+	defer runner.Stop()
+	rolled, err := runner.Rollback(context.Background(), "hello", first.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitRunning(t, st, rolled.ID)
+	waitRoute(t, routes, "hello", rolled.ID)
+	assertProxy(t, handler, "http://hello.localhost/", "hello.localhost", "version v1")
+	body := proxyBody(t, handler, "http://hello.localhost/", "hello.localhost")
+	if strings.Contains(body, "version v2") {
+		t.Fatalf("rollback still served v2: %s", body)
+	}
 
 	if _, err := sup.Stop(context.Background(), "hello"); err != nil {
 		t.Fatal(err)
@@ -119,6 +142,84 @@ func TestIntegrationHello(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("after stop %d %s", rec.Code, rec.Body.String())
 	}
+}
+
+func buildHello(t *testing.T, dir, tag, version string) {
+	t.Helper()
+	buildCtx, buildCancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer buildCancel()
+	var buildLogs strings.Builder
+	err := build.NewDocker().BuildWithArgs(buildCtx, dir, tag, map[string]string{"VERSION": version}, &buildLogs)
+	if err != nil {
+		t.Fatalf("build %s: %v\n%s", version, err, buildLogs.String())
+	}
+	if buildLogs.Len() == 0 {
+		t.Fatal("docker build produced no log output")
+	}
+}
+
+func releaseHello(t *testing.T, st store.Store, sup *runtime.Supervisor, tag string) store.Deployment {
+	t.Helper()
+	dep, err := st.CreateDeployment(context.Background(), "hello", store.DeploymentStatusStarting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
+	defer releaseCancel()
+	var runLogs strings.Builder
+	if err := sup.Release(releaseCtx, "hello", dep.ID, tag, &runLogs); err != nil {
+		name := "shipyard-hello-" + dep.ID
+		logCtx, logCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer logCancel()
+		out, _ := proc.Output(logCtx, "docker", []string{"logs", name}, proc.Spec{})
+		t.Fatalf("release %s: %v\n%s\ncontainer logs:\n%s", tag, err, runLogs.String(), out)
+	}
+	return dep
+}
+
+func waitRunning(t *testing.T, st store.Store, id string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	var last store.Deployment
+	for time.Now().Before(deadline) {
+		dep, err := st.GetDeployment(context.Background(), id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		last = dep
+		if dep.Status == store.DeploymentStatusRunning {
+			return
+		}
+		if dep.Status == store.DeploymentStatusFailed {
+			t.Fatalf("rollback failed: %s", dep.Error)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("rollback stuck in %s (%s)", last.Status, last.Error)
+}
+
+func waitRoute(t *testing.T, routes *route.Table, app, deploymentID string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Minute)
+	for time.Now().Before(deadline) {
+		if current, ok := routes.Lookup(app); ok && current.DeploymentID == deploymentID {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("route did not move to %s", deploymentID)
+}
+
+func proxyBody(t *testing.T, handler http.Handler, rawURL, host string) string {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, rawURL, nil)
+	req.Host = host
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("%s %d %s", rawURL, rec.Code, rec.Body.String())
+	}
+	return rec.Body.String()
 }
 
 func assertProxy(t *testing.T, handler http.Handler, rawURL, host, want string) {
