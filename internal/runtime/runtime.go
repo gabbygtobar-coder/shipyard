@@ -96,6 +96,11 @@ func ContainerName(app, deploymentID string) (string, error) {
 	return "shipyard-" + app + "-" + deploymentID, nil
 }
 
+// CheckSpec reports whether spec is a container Shipyard can start.
+func CheckSpec(spec Spec) error {
+	return validateSpec(spec)
+}
+
 func validateSpec(spec Spec) error {
 	name, err := ContainerName(spec.AppName, spec.DeploymentID)
 	if err != nil || name != spec.Name {

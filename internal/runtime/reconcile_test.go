@@ -34,7 +34,7 @@ func TestReconcileLocalRuntime(t *testing.T) {
 		t.Fatalf("running %#v %v", got, err)
 	}
 	got, err = st.GetDeployment(ctx, queued.ID)
-	if err != nil || got.Status != store.DeploymentStatusFailed || got.Error != "interrupted by restart" || got.FinishedAt == nil {
+	if err != nil || got.Status != store.DeploymentStatusFailed || got.Error != msgInterrupted || got.FinishedAt == nil {
 		t.Fatalf("queued %#v %v", got, err)
 	}
 	app, err := st.GetApp(ctx, "demo")
@@ -43,5 +43,40 @@ func TestReconcileLocalRuntime(t *testing.T) {
 	}
 	if time.Since(*got.FinishedAt) > time.Minute {
 		t.Fatalf("finished %s", got.FinishedAt)
+	}
+}
+
+func TestReconcileInterruptedBuildsKeepsRunning(t *testing.T) {
+	t.Parallel()
+	st := store.NewMemory()
+	ctx := context.Background()
+	if _, err := st.CreateApp(ctx, "demo", "https://github.com/acme/demo"); err != nil {
+		t.Fatal(err)
+	}
+	running, err := st.CreateDeployment(ctx, "demo", store.DeploymentStatusRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queued, err := st.CreateBuild(ctx, "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.SetAppStatus(ctx, "demo", store.AppStatusRunning, "http://alb/apps/demo/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileInterruptedBuilds(ctx, st); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.GetDeployment(ctx, running.ID)
+	if err != nil || got.Status != store.DeploymentStatusRunning {
+		t.Fatalf("running %#v %v", got, err)
+	}
+	got, err = st.GetDeployment(ctx, queued.ID)
+	if err != nil || got.Status != store.DeploymentStatusFailed || got.Error != msgInterrupted {
+		t.Fatalf("queued %#v %v", got, err)
+	}
+	app, err := st.GetApp(ctx, "demo")
+	if err != nil || app.Status != store.AppStatusRunning || app.URL == "" {
+		t.Fatalf("app %#v %v", app, err)
 	}
 }

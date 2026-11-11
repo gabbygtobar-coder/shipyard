@@ -2,7 +2,9 @@ GO ?= go
 BIN_DIR := bin
 export PATH := $(shell $(GO) env GOPATH)/bin:$(PATH)
 
-.PHONY: build test test-integration lint run compose clean cover docker
+.PHONY: build test test-integration lint run compose clean cover docker aws-up aws-down
+
+TF_DIR := infra/aws
 
 build:
 	mkdir -p $(BIN_DIR)
@@ -30,6 +32,17 @@ run:
 
 docker:
 	docker build -t shipyardd:dev .
+
+# aws-up creates the cheap dev stack. aws-down deletes ECS services first, then
+# the stack. Both ask Terraform to confirm. See docs/aws-setup.md.
+aws-up:
+	terraform -chdir=$(TF_DIR) init -input=false
+	terraform -chdir=$(TF_DIR) apply -input=false
+
+aws-down:
+	terraform -chdir=$(TF_DIR) init -input=false
+	$(TF_DIR)/empty-cluster.sh
+	terraform -chdir=$(TF_DIR) destroy -input=false
 
 clean:
 	rm -rf $(BIN_DIR) coverage.out coverage.html

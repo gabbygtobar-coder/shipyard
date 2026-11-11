@@ -26,6 +26,18 @@ func clearConfigEnv(t *testing.T) {
 		EnvDB,
 		EnvReleaseHistory,
 		EnvWebhookSecret,
+		EnvRuntime,
+		EnvAWSRegion,
+		EnvECSCluster,
+		EnvECRRepository,
+		EnvECSExecutionRoleARN,
+		EnvECSTaskRoleARN,
+		EnvECSSubnets,
+		EnvECSSecurityGroups,
+		EnvECSLogGroup,
+		EnvALBDNSName,
+		EnvBaseDomain,
+		EnvECSDeployTimeout,
 	} {
 		t.Setenv(key, "")
 	}
@@ -63,6 +75,12 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.DBPath != DefaultDBPath || cfg.ReleaseHistory != DefaultReleaseHistory || cfg.WebhookSecret != "" {
 		t.Fatalf("store %#v", cfg)
+	}
+	if cfg.Runtime != RuntimeDocker || cfg.ECSDeployTimeout != DefaultECSDeployTimeout {
+		t.Fatalf("runtime %s timeout %s", cfg.Runtime, cfg.ECSDeployTimeout)
+	}
+	if cfg.ECSCluster != "" || cfg.ALBDNSName != "" || len(cfg.ECSSubnets) != 0 {
+		t.Fatalf("ecs config %#v", cfg)
 	}
 }
 
@@ -118,6 +136,47 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 }
 
+func TestLoadECS(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv(EnvRuntime, "ecs")
+	t.Setenv(EnvAWSRegion, "us-east-1")
+	t.Setenv(EnvECSCluster, "shipyard")
+	t.Setenv(EnvECRRepository, "123456789012.dkr.ecr.us-east-1.amazonaws.com/shipyard")
+	t.Setenv(EnvECSExecutionRoleARN, "arn:aws:iam::123456789012:role/shipyard-ecs-execution")
+	t.Setenv(EnvECSTaskRoleARN, "arn:aws:iam::123456789012:role/shipyard-ecs-task")
+	t.Setenv(EnvECSSubnets, "subnet-0123456789abcdef0, subnet-abcdef0123456789a")
+	t.Setenv(EnvECSSecurityGroups, "sg-0123456789abcdef0")
+	t.Setenv(EnvECSLogGroup, "/shipyard/ecs")
+	t.Setenv(EnvALBDNSName, "shipyard-alb-123.us-east-1.elb.amazonaws.com")
+	t.Setenv(EnvBaseDomain, "example.com")
+	t.Setenv(EnvECSDeployTimeout, "8m")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Runtime != RuntimeECS || cfg.AWSRegion != "us-east-1" || cfg.ECSCluster != "shipyard" {
+		t.Fatalf("runtime %#v", cfg)
+	}
+	if len(cfg.ECSSubnets) != 2 || cfg.ECSSubnets[1] != "subnet-abcdef0123456789a" {
+		t.Fatalf("subnets %#v", cfg.ECSSubnets)
+	}
+	if cfg.BaseDomain != "example.com" || cfg.ECSDeployTimeout != 8*time.Minute {
+		t.Fatalf("domain %s timeout %s", cfg.BaseDomain, cfg.ECSDeployTimeout)
+	}
+	if cfg.ECRRepository == "" || cfg.ALBDNSName == "" || len(cfg.ECSSecurityGroups) != 1 {
+		t.Fatalf("ecs %#v", cfg)
+	}
+}
+
+func TestLoadECSRequiresSettings(t *testing.T) {
+	clearConfigEnv(t)
+	t.Setenv(EnvRuntime, "ecs")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), EnvAWSRegion) {
+		t.Fatalf("error %v", err)
+	}
+}
+
 func TestLoadWhitespaceOnlyUsesDefault(t *testing.T) {
 	clearConfigEnv(t)
 	t.Setenv(EnvAddr, "   ")
@@ -150,6 +209,8 @@ func TestLoadRejectsInvalidValues(t *testing.T) {
 		{key: EnvRuntimeNetwork, value: "-bad"},
 		{key: EnvReleaseHistory, value: "0"},
 		{key: EnvDB, value: "-bad"},
+		{key: EnvRuntime, value: "k8s"},
+		{key: EnvECSDeployTimeout, value: "1s"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.key+"="+tc.value, func(t *testing.T) {

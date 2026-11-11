@@ -14,9 +14,12 @@ import (
 
 // Spec is a subprocess invocation.
 // A nil Env uses the current process environment.
+// A nil Stdin reads from the null device, so secrets can be passed on stdin
+// without becoming command arguments.
 type Spec struct {
 	Dir    string
 	Env    []string
+	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
 }
@@ -48,6 +51,7 @@ func command(ctx context.Context, name string, args []string, spec Spec) *exec.C
 	if spec.Env != nil {
 		cmd.Env = spec.Env
 	}
+	cmd.Stdin = spec.Stdin
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
 	configureCancel(cmd)

@@ -32,3 +32,15 @@ go.work.sum
 *.db
 *.db-wal
 *.db-shm
+
+# Terraform local state and provider cache. Commit .terraform.lock.hcl.
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+.terraform.tfstate.lock.info
+infra/aws/terraform.tfvars

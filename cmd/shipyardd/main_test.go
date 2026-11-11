@@ -32,3 +32,11 @@ func TestRunUsage(t *testing.T) {
 		t.Fatalf("bad flag code %d stderr %s", code, stderr.String())
 	}
 }
+
+func TestRunECSRequiresAWSSettings(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{"--runtime", "ecs"}, &stdout, &stderr)
+	if code != 2 || !strings.Contains(stderr.String(), "SHIPYARD_AWS_REGION") {
+		t.Fatalf("code %d stderr %s", code, stderr.String())
+	}
+}
