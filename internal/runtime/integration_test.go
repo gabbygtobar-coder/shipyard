@@ -164,6 +164,9 @@ func releaseHello(t *testing.T, st store.Store, sup *runtime.Supervisor, tag str
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := st.UpdateDeployment(context.Background(), dep.ID, store.DeploymentUpdate{ImageTag: &tag}); err != nil {
+		t.Fatal(err)
+	}
 	releaseCtx, releaseCancel := context.WithTimeout(context.Background(), time.Minute)
 	defer releaseCancel()
 	var runLogs strings.Builder
