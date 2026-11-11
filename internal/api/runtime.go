@@ -21,10 +21,10 @@ func (h *handler) appURL(w http.ResponseWriter, r *http.Request) {
 	}
 	app, err := h.store.GetApp(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
-	if app.Status != store.AppStatusRunning || app.URL == "" {
+	if app.URL == "" || (app.Status != store.AppStatusRunning && app.Status != store.AppStatusUnhealthy) {
 		writeError(w, http.StatusConflict, runtime.ErrNotRunning.Error())
 		return
 	}
@@ -38,7 +38,7 @@ func (h *handler) stopApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := h.store.GetApp(r.Context(), name); err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	if h.run == nil {
@@ -50,12 +50,12 @@ func (h *handler) stopApp(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, err.Error())
 			return
 		}
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	app, err := h.store.GetApp(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, app)

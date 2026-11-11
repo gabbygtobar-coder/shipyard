@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gabbygtobar-coder/shipyard/internal/requestid"
 	"github.com/gabbygtobar-coder/shipyard/internal/route"
 )
 
@@ -62,6 +63,32 @@ func TestProxyHostAndPathRouting(t *testing.T) {
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK || gotPath != "/" {
 		t.Fatalf("bare app path %d %s", rec.Code, gotPath)
+	}
+}
+
+func TestProxyPropagatesRequestID(t *testing.T) {
+	t.Parallel()
+	var gotID string
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotID = r.Header.Get(requestid.Header)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(backend.Close)
+
+	routes := route.NewTable()
+	routes.Swap("hello", route.Target{Endpoint: backend.URL, InstanceID: "abc", DeploymentID: "dep_1"})
+	var logs bytes.Buffer
+	handler := New(routes, slog.New(slog.NewTextHandler(&logs, nil)))
+	req := httptest.NewRequest(http.MethodGet, "http://hello.localhost/", nil)
+	req.Host = "hello.localhost"
+	req.Header.Set(requestid.Header, "trace-1234")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent || rec.Header().Get(requestid.Header) != "trace-1234" || gotID != "trace-1234" {
+		t.Fatalf("status %d response %q upstream %q", rec.Code, rec.Header().Get(requestid.Header), gotID)
+	}
+	if !strings.Contains(logs.String(), "request_id=trace-1234") {
+		t.Fatalf("log %s", logs.String())
 	}
 }
 

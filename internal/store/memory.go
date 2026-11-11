@@ -25,7 +25,9 @@ type Memory struct {
 	logTrunc   map[string]bool
 	releases   map[string][]Release
 	deliveries map[string]struct{}
+	events     map[string][]Event
 	nextDep    int
+	nextEvent  int64
 }
 
 // NewMemory returns an empty in-memory store that timestamps with time.Now.
@@ -47,6 +49,7 @@ func NewMemoryWithClock(now func() time.Time) *Memory {
 		logTrunc:   make(map[string]bool),
 		releases:   make(map[string][]Release),
 		deliveries: make(map[string]struct{}),
+		events:     make(map[string][]Event),
 	}
 }
 
@@ -545,6 +548,74 @@ func (m *Memory) ListReleases(ctx context.Context, appName string) ([]Release, e
 	return out, nil
 }
 
+// Ping implements Store.
+func (m *Memory) Ping(ctx context.Context) error {
+	return ctx.Err()
+}
+
+// AppendEvent implements Store.
+func (m *Memory) AppendEvent(ctx context.Context, ev Event) (Event, error) {
+	if err := ctx.Err(); err != nil {
+		return Event{}, err
+	}
+	ev, err := normalizeEvent(ev)
+	if err != nil {
+		return Event{}, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apps[ev.AppName]; !ok {
+		return Event{}, ErrNotFound
+	}
+	m.nextEvent++
+	ev.ID = m.nextEvent
+	ev.CreatedAt = m.now().UTC()
+	m.events[ev.AppName] = append(m.events[ev.AppName], ev)
+	return ev, nil
+}
+
+// ListEvents implements Store.
+func (m *Memory) ListEvents(ctx context.Context, appName string, limit int) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	appName = strings.TrimSpace(appName)
+	if appName == "" {
+		return nil, ErrInvalid
+	}
+	limit = clampEventLimit(limit)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.apps[appName]; !ok {
+		return nil, ErrNotFound
+	}
+	list := m.events[appName]
+	if len(list) > limit {
+		list = list[len(list)-limit:]
+	}
+	out := make([]Event, 0, len(list))
+	for i := len(list) - 1; i >= 0; i-- {
+		out = append(out, list[i])
+	}
+	return out, nil
+}
+
+// CountActiveDeployments implements Store.
+func (m *Memory) CountActiveDeployments(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, dep := range m.deps {
+		if activeDeployment(dep.Status) {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func prepareDeploymentUpdate(upd DeploymentUpdate) (DeploymentUpdate, error) {
 	if upd.Ref != nil {
 		if err := giturl.ValidateRef(strings.TrimSpace(*upd.Ref)); err != nil {
@@ -658,7 +729,7 @@ func validAppStatus(status, appURL string) bool {
 	switch status {
 	case AppStatusIdle, AppStatusStopped:
 		return appURL == ""
-	case AppStatusRunning:
+	case AppStatusRunning, AppStatusUnhealthy:
 		return appURL != "" && len(appURL) <= 2048
 	default:
 		return false

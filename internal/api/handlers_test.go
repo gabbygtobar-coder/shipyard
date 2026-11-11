@@ -377,3 +377,19 @@ func (s stubStore) RecordRelease(context.Context, string, int) ([]store.Release,
 func (s stubStore) ListReleases(context.Context, string) ([]store.Release, error) {
 	return nil, errors.New("release not stubbed")
 }
+
+func (s stubStore) Ping(context.Context) error {
+	return nil
+}
+
+func (s stubStore) AppendEvent(context.Context, store.Event) (store.Event, error) {
+	return store.Event{}, nil
+}
+
+func (s stubStore) ListEvents(context.Context, string, int) ([]store.Event, error) {
+	return nil, errors.New("events not stubbed")
+}
+
+func (s stubStore) CountActiveDeployments(context.Context) (int, error) {
+	return 0, nil
+}

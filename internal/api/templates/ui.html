@@ -1,0 +1,200 @@
+{{define "style"}}
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #f4f6f8;
+    --card: #fff;
+    --ink: #1c2430;
+    --muted: #5c6b7a;
+    --line: #d8dee6;
+    --accent: #1f6b4a;
+    --danger: #9d2c2c;
+    --warn: #8a5a00;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 15px/1.45 ui-sans-serif, system-ui, sans-serif;
+    background: var(--bg);
+    color: var(--ink);
+  }
+  header, main { width: min(960px, calc(100% - 32px)); margin: 0 auto; }
+  header { padding: 28px 0 8px; }
+  header a { color: inherit; font-weight: 650; text-decoration: none; letter-spacing: -0.02em; }
+  header p { margin: 4px 0 0; color: var(--muted); }
+  main { padding-bottom: 48px; }
+  .banner, .notice {
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    margin: 16px 0;
+  }
+  .banner { border-color: #e4b4b4; color: var(--danger); }
+  .notice { border-color: #b7d7c6; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+  a { color: var(--accent); }
+  .status {
+    display: inline-block;
+    padding: 1px 8px;
+    border-radius: 999px;
+    background: #eef1f4;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .status.running { background: #e5f4ec; color: var(--accent); }
+  .status.unhealthy, .status.failed { background: #fdecec; color: var(--danger); }
+  .status.starting, .status.building, .status.queued { background: #fff4d6; color: var(--warn); }
+  section { margin-top: 28px; }
+  h1 { font-size: 28px; margin: 12px 0 4px; letter-spacing: -0.03em; }
+  h2 { font-size: 16px; margin: 0 0 8px; }
+  .meta { color: var(--muted); margin: 0; }
+  form { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+  label { display: grid; gap: 4px; color: var(--muted); font-size: 13px; }
+  select, button {
+    font: inherit;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    background: var(--card);
+    color: var(--ink);
+  }
+  button { background: var(--ink); color: #fff; border-color: var(--ink); cursor: pointer; }
+  .empty { color: var(--muted); }
+  code { font-family: ui-monospace, monospace; font-size: 13px; }
+</style>
+{{end}}
+
+{{define "index"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · Shipyard</title>
+  {{template "style" .}}
+</head>
+<body>
+  <header>
+    <a href="/ui">Shipyard</a>
+    <p>Applications on this control plane.</p>
+  </header>
+  <main>
+    {{if not .Apps}}<p class="empty">No applications yet.</p>{{else}}
+    <table>
+      <thead>
+        <tr><th>App</th><th>Status</th><th>URL</th><th>Current deployment</th></tr>
+      </thead>
+      <tbody>
+        {{range .Apps}}
+        <tr>
+          <td><a href="/ui/apps/{{.Name}}">{{.Name}}</a></td>
+          <td><span class="status {{.Status}}">{{.Status}}</span></td>
+          <td>{{if safeURL .URL}}<a href="{{safeURL .URL}}">{{.URL}}</a>{{else}}{{.URL}}{{end}}</td>
+          <td>{{if .Current}}<code>{{.Current}}</code>{{else}}—{{end}}</td>
+        </tr>
+        {{end}}
+      </tbody>
+    </table>
+    {{end}}
+  </main>
+  {{if .Pending}}<script>setTimeout(function () { location.reload(); }, 3000);</script>{{end}}
+</body>
+</html>
+{{end}}
+
+{{define "app"}}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Title}} · Shipyard</title>
+  {{template "style" .}}
+</head>
+<body>
+  <header>
+    <a href="/ui">Shipyard</a>
+    <p><a href="/ui">All apps</a></p>
+  </header>
+  <main>
+    {{if .Notice}}<p class="notice">{{.Notice}}</p>{{end}}
+    {{if .Error}}<p class="banner">{{.Error}}</p>{{end}}
+    <h1>{{.App.Name}}</h1>
+    <p class="meta">
+      <span class="status {{.App.Status}}">{{.App.Status}}</span>
+      {{if .App.URL}} · {{if safeURL .App.URL}}<a href="{{safeURL .App.URL}}">{{.App.URL}}</a>{{else}}{{.App.URL}}{{end}}{{end}}
+    </p>
+    <p class="meta"><code>{{.App.RepoURL}}</code> · branch {{.App.Branch}}{{if .App.AutoDeploy}} · auto-deploy{{end}}</p>
+    {{if .App.Current}}
+    <p class="meta">Current deployment <code>{{.App.Current.ID}}</code> {{.App.Current.Status}}
+      {{if .App.Current.ImageTag}} · <code>{{.App.Current.ImageTag}}</code>{{end}}
+    </p>
+    {{end}}
+
+    <section>
+      <h2>Rollback</h2>
+      {{if .App.Releases}}
+      <form method="post" action="/ui/apps/{{.App.Name}}/rollback" onsubmit="return confirm('Roll back this app?');">
+        <input type="hidden" name="confirm" value="rollback">
+        <label>Release
+          <select name="deployment_id">
+            <option value="">previous release</option>
+            {{range .App.Releases}}
+            <option value="{{.DeploymentID}}">{{.DeploymentID}} · {{.ImageTag}}</option>
+            {{end}}
+          </select>
+        </label>
+        <button type="submit">Roll back</button>
+      </form>
+      {{else}}
+      <p class="empty">No retained release.</p>
+      {{end}}
+    </section>
+
+    <section>
+      <h2>Recent deployments</h2>
+      {{if not .App.Deployments}}<p class="empty">No deployments yet.</p>{{else}}
+      <table>
+        <thead>
+          <tr><th>ID</th><th>Status</th><th>Ref</th><th>Created</th><th></th></tr>
+        </thead>
+        <tbody>
+          {{range .App.Deployments}}
+          <tr>
+            <td><code>{{.ID}}</code></td>
+            <td><span class="status {{.Status}}">{{.Status}}</span></td>
+            <td>{{if .Ref}}{{.Ref}}{{else}}default{{end}}</td>
+            <td>{{.CreatedAt.UTC.Format "2006-01-02 15:04:05Z"}}</td>
+            <td><a href="/deployments/{{.ID}}/logs">logs</a></td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{end}}
+    </section>
+
+    <section>
+      <h2>Events</h2>
+      {{if not .App.Events}}<p class="empty">No events yet.</p>{{else}}
+      <table>
+        <thead>
+          <tr><th>When</th><th>Type</th><th>Message</th></tr>
+        </thead>
+        <tbody>
+          {{range .App.Events}}
+          <tr>
+            <td>{{.CreatedAt.UTC.Format "2006-01-02 15:04:05Z"}}</td>
+            <td>{{.Type}}</td>
+            <td>{{.Message}}{{if .DeploymentID}} · <code>{{.DeploymentID}}</code>{{end}}</td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+      {{end}}
+    </section>
+  </main>
+  {{if .Pending}}<script>setTimeout(function () { location.reload(); }, 3000);</script>{{end}}
+</body>
+</html>
+{{end}}

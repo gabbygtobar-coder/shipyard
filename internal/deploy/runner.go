@@ -19,6 +19,7 @@ import (
 
 	"github.com/gabbygtobar-coder/shipyard/internal/build"
 	"github.com/gabbygtobar-coder/shipyard/internal/giturl"
+	"github.com/gabbygtobar-coder/shipyard/internal/metrics"
 	"github.com/gabbygtobar-coder/shipyard/internal/runtime"
 	"github.com/gabbygtobar-coder/shipyard/internal/source"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
@@ -86,6 +87,8 @@ type Config struct {
 	Now            func() time.Time
 	ReleaseHistory int
 	Images         ImageRemover
+	// Metrics receives build and deploy observations. Nil skips them.
+	Metrics *metrics.Metrics
 }
 
 // Runner executes builds on a fixed set of workers.
@@ -102,6 +105,7 @@ type Runner struct {
 	now          func() time.Time
 	images       ImageRemover
 	releaseKeep  int
+	metrics      *metrics.Metrics
 
 	mu      sync.Mutex
 	jobs    chan string
@@ -153,6 +157,7 @@ func New(cfg Config) (*Runner, error) {
 		buildTimeout: cfg.BuildTimeout,
 		cloneTimeout: cfg.CloneTimeout,
 		releaseKeep:  cfg.ReleaseHistory,
+		metrics:      cfg.Metrics,
 		log:          cfg.Logger,
 		now:          cfg.Now,
 		pending:      make(map[string]string),
@@ -331,10 +336,18 @@ func (r *Runner) clearPending(id string) {
 }
 
 func (r *Runner) execute(id string) {
+	var started time.Time
+	var buildStatus string
 	defer func() {
 		if rec := recover(); rec != nil {
 			r.log.Error("build panic", "deployment", id, "err", fmt.Sprint(rec))
 			r.finish(id, store.DeploymentStatusFailed, "", "", msgInternal)
+			if !started.IsZero() && buildStatus == "" {
+				buildStatus = store.DeploymentStatusFailed
+			}
+		}
+		if buildStatus != "" {
+			r.observeBuild(started, buildStatus)
 		}
 	}()
 	if r.ctx.Err() != nil {
@@ -352,13 +365,14 @@ func (r *Runner) execute(id string) {
 		return
 	}
 
-	started := r.now().UTC()
+	started = r.now().UTC()
 	building := store.DeploymentStatusBuilding
 	if _, err := r.store.UpdateDeployment(context.Background(), id, store.DeploymentUpdate{
 		Status:    &building,
 		StartedAt: &started,
 	}); err != nil {
 		r.log.Error("mark building", "deployment", id, "err", err)
+		buildStatus = store.DeploymentStatusFailed
 		r.finish(id, store.DeploymentStatusFailed, "", "", msgInternal)
 		return
 	}
@@ -366,11 +380,13 @@ func (r *Runner) execute(id string) {
 	dep, err := r.store.GetDeployment(context.Background(), id)
 	if err != nil {
 		r.log.Error("load deployment", "deployment", id, "err", err)
+		buildStatus = store.DeploymentStatusFailed
 		r.finish(id, store.DeploymentStatusFailed, "", "", msgInternal)
 		return
 	}
 	app, err := r.store.GetApp(context.Background(), dep.AppName)
 	if err != nil {
+		buildStatus = store.DeploymentStatusFailed
 		r.finish(id, store.DeploymentStatusFailed, "", "", msgInternal)
 		return
 	}
@@ -381,12 +397,14 @@ func (r *Runner) execute(id string) {
 	dir, err := os.MkdirTemp("", "shipyard-build-")
 	if err != nil {
 		r.log.Error("temp dir", "deployment", id, "err", err)
+		buildStatus = store.DeploymentStatusFailed
 		r.finish(id, store.DeploymentStatusFailed, "", "", msgInternal)
 		return
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
 	fail := func(sha, msg string) {
 		_ = os.RemoveAll(dir)
+		buildStatus = store.DeploymentStatusFailed
 		r.finish(id, store.DeploymentStatusFailed, "", sha, msg)
 	}
 
@@ -465,6 +483,7 @@ func (r *Runner) execute(id string) {
 		return
 	}
 	_, _ = fmt.Fprintf(&logs, "built %s\n", tag)
+	buildStatus = store.DeploymentStatusSucceeded
 	_ = os.RemoveAll(dir)
 	if r.releaser == nil {
 		r.finish(id, store.DeploymentStatusSucceeded, tag, sha, "")
@@ -548,6 +567,7 @@ func (r *Runner) executeRollback(dep store.Deployment) {
 }
 
 func (r *Runner) retain(id string) {
+	r.recordOutcome(id)
 	dropped, err := r.store.RecordRelease(context.Background(), id, r.releaseKeep)
 	if err != nil {
 		r.log.Error("record release", "deployment", id, "err", err)
@@ -660,8 +680,45 @@ func (r *Runner) finish(id, status, image, sha, errMsg string) {
 	if errMsg != "" {
 		upd.Error = &errMsg
 	}
-	if _, err := r.store.UpdateDeployment(context.Background(), id, upd); err != nil && !errors.Is(err, store.ErrInvalid) && !errors.Is(err, store.ErrNotFound) {
-		r.log.Error("finish deployment", "deployment", id, "err", err)
+	if _, err := r.store.UpdateDeployment(context.Background(), id, upd); err != nil {
+		if !errors.Is(err, store.ErrInvalid) && !errors.Is(err, store.ErrNotFound) {
+			r.log.Error("finish deployment", "deployment", id, "err", err)
+		}
+		return
+	}
+	r.metrics.ObserveDeploy(status)
+}
+
+func (r *Runner) observeBuild(started time.Time, status string) {
+	d := time.Duration(0)
+	if !started.IsZero() {
+		d = r.now().Sub(started)
+	}
+	r.metrics.ObserveBuild(status, d)
+}
+
+func (r *Runner) recordOutcome(id string) {
+	dep, err := r.store.GetDeployment(context.Background(), id)
+	if err != nil {
+		r.log.Error("record event", "deployment", id, "err", err)
+		return
+	}
+	kind := store.EventDeployed
+	msg := "deployment " + dep.ID + " is " + dep.Status
+	if dep.RollbackOf != "" {
+		kind = store.EventRolledBack
+		msg = "rolled back " + dep.RollbackOf + " as " + dep.ID
+	}
+	if dep.Status == store.DeploymentStatusRunning {
+		r.metrics.ObserveDeploy(dep.Status)
+	}
+	if _, err := r.store.AppendEvent(context.Background(), store.Event{
+		AppName:      dep.AppName,
+		Type:         kind,
+		Message:      msg,
+		DeploymentID: dep.ID,
+	}); err != nil {
+		r.log.Error("record event", "deployment", id, "err", err)
 	}
 }
 

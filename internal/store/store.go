@@ -4,8 +4,9 @@
 // store: status, git ref, commit, image tag, timestamps, error text, and the
 // captured build log. M2 adds the running and stopped statuses, a public URL,
 // and the app's current routing status. M4 adds the branch, auto-deploy
-// setting, webhook delivery ids, and the releases kept for rollback. Memory
-// is still what tests use. SQLite is the durable implementation.
+// setting, webhook delivery ids, and the releases kept for rollback. M5 adds
+// an append-only per-app event log. Memory is still what tests use. SQLite is
+// the durable implementation.
 package store
 
 import (
@@ -51,6 +52,9 @@ const (
 	AppStatusRunning = "running"
 	// AppStatusStopped means the last running container was stopped.
 	AppStatusStopped = "stopped"
+	// AppStatusUnhealthy means the running container failed repeated health checks.
+	// The public URL is kept so the proxy and the dashboard still name the app.
+	AppStatusUnhealthy = "unhealthy"
 
 	// MaxDeploymentLogBytes is the captured build log kept per deployment.
 	MaxDeploymentLogBytes = 1 << 20
@@ -194,6 +198,17 @@ type Store interface {
 	RecordRelease(ctx context.Context, deploymentID string, keep int) ([]Release, error)
 	// ListReleases returns retained releases for one app, newest first.
 	ListReleases(ctx context.Context, appName string) ([]Release, error)
+
+	// Ping reports whether the store can answer a query.
+	Ping(ctx context.Context) error
+	// AppendEvent adds one append-only event for an existing app.
+	AppendEvent(ctx context.Context, ev Event) (Event, error)
+	// ListEvents returns events for one app, newest first.
+	// limit is clamped to the range 1..MaxEventLimit. Zero uses DefaultEventLimit.
+	ListEvents(ctx context.Context, appName string, limit int) ([]Event, error)
+	// CountActiveDeployments counts deployments that are queued, building,
+	// starting, or running.
+	CountActiveDeployments(ctx context.Context) (int, error)
 }
 
 // IsTerminalStatus reports whether log streaming can stop.

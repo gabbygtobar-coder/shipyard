@@ -571,6 +571,114 @@ func (s *SQLite) ListReleases(ctx context.Context, appName string) ([]Release, e
 	return out, nil
 }
 
+// Ping implements Store.
+func (s *SQLite) Ping(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return errors.New("database is closed")
+	}
+	return s.db.PingContext(ctx)
+}
+
+// AppendEvent implements Store.
+func (s *SQLite) AppendEvent(ctx context.Context, ev Event) (Event, error) {
+	if err := ctx.Err(); err != nil {
+		return Event{}, err
+	}
+	ev, err := normalizeEvent(ev)
+	if err != nil {
+		return Event{}, err
+	}
+	ev.CreatedAt = s.now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.appByName(ctx, ev.AppName); err != nil {
+		return Event{}, err
+	}
+	res, err := s.db.ExecContext(ctx, `
+		INSERT INTO events(app_name, type, message, deployment_id, created_at)
+		VALUES (?, ?, ?, ?, ?)`,
+		ev.AppName, ev.Type, ev.Message, ev.DeploymentID, formatTime(ev.CreatedAt))
+	if err != nil {
+		return Event{}, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return Event{}, err
+	}
+	ev.ID = id
+	return ev, nil
+}
+
+// ListEvents implements Store.
+func (s *SQLite) ListEvents(ctx context.Context, appName string, limit int) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	appName = strings.TrimSpace(appName)
+	if appName == "" {
+		return nil, ErrInvalid
+	}
+	limit = clampEventLimit(limit)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.appByName(ctx, appName); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, app_name, type, message, deployment_id, created_at
+		FROM events WHERE app_name = ? ORDER BY id DESC LIMIT ?`, appName, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	out := make([]Event, 0)
+	for rows.Next() {
+		ev, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// CountActiveDeployments implements Store.
+func (s *SQLite) CountActiveDeployments(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	err := s.db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM deployments
+		WHERE status IN (?, ?, ?, ?)`,
+		DeploymentStatusQueued, DeploymentStatusBuilding, DeploymentStatusStarting, DeploymentStatusRunning).Scan(&n)
+	return n, err
+}
+
+func scanEvent(row scanner) (Event, error) {
+	var ev Event
+	var created string
+	if err := row.Scan(&ev.ID, &ev.AppName, &ev.Type, &ev.Message, &ev.DeploymentID, &created); err != nil {
+		return Event{}, err
+	}
+	t, err := parseTime(created)
+	if err != nil {
+		return Event{}, err
+	}
+	ev.CreatedAt = t
+	return ev, nil
+}
+
 func (s *SQLite) insertDeployment(ctx context.Context, appName, status, ref, sha, image, rollbackOf string) (Deployment, error) {
 	if _, err := s.appByName(ctx, appName); err != nil {
 		return Deployment{}, err

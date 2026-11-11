@@ -114,7 +114,7 @@ func TestSQLitePersistsAcrossReopen(t *testing.T) {
 	if err := again.db.QueryRow(`SELECT COUNT(1) FROM schema_migrations`).Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != 1 {
+	if version != 2 {
 		t.Fatalf("migrations %d", version)
 	}
 }

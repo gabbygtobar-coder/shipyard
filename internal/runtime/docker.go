@@ -105,6 +105,41 @@ func (d *Docker) RemoveImage(ctx context.Context, tag string) error {
 	return nil
 }
 
+// Ready reports whether the local Docker daemon answers docker info.
+func (d *Docker) Ready(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := d.look(dockerBinary); err != nil {
+		return ErrDockerNotFound
+	}
+	var stderr bytes.Buffer
+	err := d.run.Run(ctx, dockerBinary, []string{"info", "--format", "{{.ServerVersion}}"}, proc.Spec{Stdout: io.Discard, Stderr: &stderr})
+	if err != nil {
+		return fmt.Errorf("docker info: %w%s", err, suffix(stderr.String()))
+	}
+	return nil
+}
+
+// Restart restarts one container in place. The container id does not change.
+func (d *Docker) Restart(ctx context.Context, id string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateContainerRef(id); err != nil {
+		return err
+	}
+	if err := d.look(dockerBinary); err != nil {
+		return ErrDockerNotFound
+	}
+	var stderr bytes.Buffer
+	err := d.run.Run(ctx, dockerBinary, []string{"restart", "--time", "10", "--", id}, proc.Spec{Stdout: io.Discard, Stderr: &stderr})
+	if err != nil {
+		return fmt.Errorf("docker restart: %w%s", err, suffix(stderr.String()))
+	}
+	return nil
+}
+
 // Stop implements Runtime.
 func (d *Docker) Stop(ctx context.Context, id string) error {
 	if err := validateContainerRef(id); err != nil {

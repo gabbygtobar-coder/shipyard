@@ -38,6 +38,10 @@ func clearConfigEnv(t *testing.T) {
 		EnvALBDNSName,
 		EnvBaseDomain,
 		EnvECSDeployTimeout,
+		EnvMonitorInterval,
+		EnvMonitorThreshold,
+		EnvAutoRestart,
+		EnvUIToken,
 	} {
 		t.Setenv(key, "")
 	}
@@ -78,6 +82,9 @@ func TestLoadDefaults(t *testing.T) {
 	}
 	if cfg.Runtime != RuntimeDocker || cfg.ECSDeployTimeout != DefaultECSDeployTimeout {
 		t.Fatalf("runtime %s timeout %s", cfg.Runtime, cfg.ECSDeployTimeout)
+	}
+	if cfg.MonitorInterval != DefaultMonitorInterval || cfg.MonitorThreshold != DefaultMonitorThreshold || cfg.AutoRestart || cfg.UIToken != "" {
+		t.Fatalf("monitor %#v", cfg)
 	}
 	if cfg.ECSCluster != "" || cfg.ALBDNSName != "" || len(cfg.ECSSubnets) != 0 {
 		t.Fatalf("ecs config %#v", cfg)

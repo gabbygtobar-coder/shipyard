@@ -342,6 +342,15 @@ func (r *Runtime) rollBack(ctx context.Context, current ServiceInput, previousAR
 	}
 }
 
+// Ready reports whether the ECS runtime has its clients and config.
+// It does not call AWS. A failed AWS call surfaces on the next deploy.
+func (r *Runtime) Ready(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return r.ready()
+}
+
 func (r *Runtime) ready() error {
 	if r.images == nil || r.cluster == nil || r.targets == nil || r.logs == nil || r.push == nil {
 		return errors.New("ecs runtime is not configured")

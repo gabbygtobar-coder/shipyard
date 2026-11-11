@@ -44,7 +44,7 @@ func (h *handler) createDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	dep, err := h.builds.StartBuild(r.Context(), name, ref)
 	if err != nil {
-		h.writeBuildError(w, err)
+		h.writeBuildError(w, r, err)
 		return
 	}
 	w.Header().Set("Location", "/deployments/"+url.PathEscape(dep.ID))
@@ -59,7 +59,7 @@ func (h *handler) listDeployments(w http.ResponseWriter, r *http.Request) {
 	}
 	deps, err := h.store.ListDeployments(r.Context(), name)
 	if err != nil {
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 		return
 	}
 	if deps == nil {
@@ -75,7 +75,7 @@ func (h *handler) getDeployment(w http.ResponseWriter, r *http.Request) {
 	}
 	dep, err := h.store.GetDeployment(r.Context(), id)
 	if err != nil {
-		h.writeStoreError(w, err, errDeploymentNotFound)
+		h.writeStoreError(w, r, err, errDeploymentNotFound)
 		return
 	}
 	writeJSON(w, http.StatusOK, dep)
@@ -94,7 +94,7 @@ func (h *handler) deploymentLogs(w http.ResponseWriter, r *http.Request) {
 		snap, err := h.store.ReadDeploymentLog(r.Context(), id, offset)
 		if err != nil {
 			if !header {
-				h.writeStoreError(w, err, errDeploymentNotFound)
+				h.writeStoreError(w, r, err, errDeploymentNotFound)
 			}
 			return
 		}
@@ -141,7 +141,7 @@ func wantsFollow(r *http.Request) bool {
 	}
 }
 
-func (h *handler) writeBuildError(w http.ResponseWriter, err error) {
+func (h *handler) writeBuildError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
 	case errors.Is(err, deploy.ErrQueueFull), errors.Is(err, deploy.ErrStopped):
 		writeError(w, http.StatusServiceUnavailable, err.Error())
@@ -152,7 +152,7 @@ func (h *handler) writeBuildError(w http.ResponseWriter, err error) {
 	case errors.Is(err, store.ErrInvalid):
 		writeError(w, http.StatusBadRequest, errInvalidDeployment)
 	default:
-		h.writeStoreError(w, err, errAppNotFound)
+		h.writeStoreError(w, r, err, errAppNotFound)
 	}
 }
 

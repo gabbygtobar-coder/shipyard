@@ -96,6 +96,22 @@ type releaseListResponse struct {
 	Releases []store.Release `json:"releases"`
 }
 
+type eventListResponse struct {
+	Events []store.Event `json:"events"`
+}
+
+func (c *apiClient) events(ctx context.Context, name string) (eventListResponse, error) {
+	var out eventListResponse
+	path := "/apps/" + url.PathEscape(name) + "/events"
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return eventListResponse{}, err
+	}
+	if out.Events == nil {
+		out.Events = []store.Event{}
+	}
+	return out, nil
+}
+
 func (c *apiClient) releases(ctx context.Context, name string) (releaseListResponse, error) {
 	var out releaseListResponse
 	path := "/apps/" + url.PathEscape(name) + "/releases"

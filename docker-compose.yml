@@ -16,6 +16,35 @@ services:
       SHIPYARD_PROXY_ADDR: ":8081"
       SHIPYARD_RUNTIME_NETWORK: shipyard
       SHIPYARD_DB: /data/shipyard.db
+      SHIPYARD_UI_TOKEN: ${SHIPYARD_UI_TOKEN:-}
+      SHIPYARD_AUTO_RESTART: ${SHIPYARD_AUTO_RESTART:-false}
+    networks:
+      - shipyard
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: ["observability"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks:
+      - shipyard
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    profiles: ["observability"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/shipyard.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
     networks:
       - shipyard
 
