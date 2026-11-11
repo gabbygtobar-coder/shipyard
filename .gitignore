@@ -1,0 +1,29 @@
+# Binaries
+bin/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/shipyard
+/shipyardd
+
+# Test and coverage
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Local env
+.env
+.env.*

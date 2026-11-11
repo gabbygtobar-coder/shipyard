@@ -1,0 +1,10 @@
+.git
+.github
+bin
+coverage.out
+coverage.html
+**/*_test.go
+README.md
+LICENSE
+.env
+.env.*
