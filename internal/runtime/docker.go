@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gabbygtobar-coder/shipyard/internal/build"
 	"github.com/gabbygtobar-coder/shipyard/internal/proc"
 )
 
@@ -86,6 +87,22 @@ func (d *Docker) Start(ctx context.Context, spec Spec) (Instance, error) {
 		DeploymentID: spec.DeploymentID,
 		Endpoint:     endpoint,
 	}, nil
+}
+
+// RemoveImage deletes a local image tag that is no longer retained.
+func (d *Docker) RemoveImage(ctx context.Context, tag string) error {
+	if err := build.ValidateTag(tag); err != nil {
+		return ErrInvalidSpec
+	}
+	if err := d.look(dockerBinary); err != nil {
+		return ErrDockerNotFound
+	}
+	var stderr bytes.Buffer
+	err := d.run.Run(ctx, dockerBinary, []string{"rmi", "--", tag}, proc.Spec{Stdout: io.Discard, Stderr: &stderr})
+	if err != nil {
+		return fmt.Errorf("docker rmi: %w%s", err, suffix(stderr.String()))
+	}
+	return nil
 }
 
 // Stop implements Runtime.

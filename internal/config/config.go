@@ -41,6 +41,12 @@ const (
 	DefaultHealthTimeout = 30 * time.Second
 	// DefaultHealthInterval is the delay between health probes.
 	DefaultHealthInterval = 500 * time.Millisecond
+	// DefaultReleaseHistory is how many successful images are kept per app.
+	DefaultReleaseHistory = 5
+	// DefaultDBPath is the SQLite file used when SHIPYARD_DB is unset.
+	DefaultDBPath = "shipyard.db"
+	// MemoryDBPath selects the in-memory store instead of SQLite.
+	MemoryDBPath = "memory"
 
 	// EnvAddr is the environment variable that overrides the server listen address.
 	EnvAddr = "SHIPYARD_ADDR"
@@ -73,6 +79,13 @@ const (
 	// EnvRuntimeNetwork attaches app containers to a Docker network.
 	// Empty publishes a random port on 127.0.0.1 instead.
 	EnvRuntimeNetwork = "SHIPYARD_RUNTIME_NETWORK"
+	// EnvDB is the SQLite file. "memory" keeps the in-memory store.
+	EnvDB = "SHIPYARD_DB"
+	// EnvReleaseHistory is how many successful images to keep per app.
+	EnvReleaseHistory = "SHIPYARD_RELEASE_HISTORY"
+	// EnvWebhookSecret is the global GitHub webhook HMAC secret.
+	// It is read from the environment and is never logged.
+	EnvWebhookSecret = "SHIPYARD_GITHUB_WEBHOOK_SECRET"
 
 	minBuildConcurrency = 1
 	maxBuildConcurrency = 32
@@ -92,6 +105,9 @@ const (
 	maxHealthTimeout    = 5 * time.Minute
 	minHealthInterval   = 50 * time.Millisecond
 	maxHealthInterval   = 10 * time.Second
+	minReleaseHistory   = 1
+	maxReleaseHistory   = 50
+	maxWebhookSecret    = 256
 )
 
 var networkNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$`)
@@ -127,6 +143,13 @@ type Config struct {
 	// RuntimeNetwork is a Docker network for app containers.
 	// Empty publishes a random host port on 127.0.0.1.
 	RuntimeNetwork string
+	// DBPath is the SQLite database file, or MemoryDBPath.
+	DBPath string
+	// ReleaseHistory is how many successful images are kept for rollback.
+	ReleaseHistory int
+	// WebhookSecret is the global GitHub HMAC secret. Empty means only a
+	// per-app secret can verify deliveries. It must never be logged.
+	WebhookSecret string
 }
 
 // Defaults returns configuration with no environment overrides applied.
@@ -145,6 +168,8 @@ func Defaults() Config {
 		HealthPath:       DefaultHealthPath,
 		HealthTimeout:    DefaultHealthTimeout,
 		HealthInterval:   DefaultHealthInterval,
+		DBPath:           DefaultDBPath,
+		ReleaseHistory:   DefaultReleaseHistory,
 	}
 }
 
@@ -198,6 +223,15 @@ func (c Config) Check() error {
 	if c.RuntimeNetwork != "" && !networkNamePattern.MatchString(c.RuntimeNetwork) {
 		return fmt.Errorf("runtime network must be a docker network name")
 	}
+	if err := checkDBPath(c.DBPath); err != nil {
+		return err
+	}
+	if c.ReleaseHistory < minReleaseHistory || c.ReleaseHistory > maxReleaseHistory {
+		return fmt.Errorf("release history must be from %d to %d", minReleaseHistory, maxReleaseHistory)
+	}
+	if err := checkWebhookSecret(c.WebhookSecret); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -212,10 +246,10 @@ func Load() (Config, error) {
 		cfg.ProxyAddr = addr
 	}
 	var err error
-	if cfg.BuildConcurrency, err = envInt(EnvBuildConcurrency, DefaultBuildConcurrency, minBuildConcurrency, maxBuildConcurrency); err != nil {
+	if cfg.BuildConcurrency, err = envInt(EnvBuildConcurrency, DefaultBuildConcurrency, maxBuildConcurrency); err != nil {
 		return Config{}, err
 	}
-	if cfg.BuildQueueSize, err = envInt(EnvBuildQueueSize, DefaultBuildQueueSize, minBuildQueueSize, maxBuildQueueSize); err != nil {
+	if cfg.BuildQueueSize, err = envInt(EnvBuildQueueSize, DefaultBuildQueueSize, maxBuildQueueSize); err != nil {
 		return Config{}, err
 	}
 	if cfg.BuildTimeout, err = envDuration(EnvBuildTimeout, DefaultBuildTimeout); err != nil {
@@ -230,7 +264,7 @@ func Load() (Config, error) {
 	if cfg.CloneMaxBytes, err = envInt64(EnvCloneMaxBytes, DefaultCloneMaxBytes, minCloneBytes, maxCloneBytes); err != nil {
 		return Config{}, err
 	}
-	if cfg.ContainerPort, err = envInt(EnvContainerPort, DefaultContainerPort, minContainerPort, maxContainerPort); err != nil {
+	if cfg.ContainerPort, err = envInt(EnvContainerPort, DefaultContainerPort, maxContainerPort); err != nil {
 		return Config{}, err
 	}
 	if cfg.MemoryBytes, err = envInt64(EnvMemoryBytes, DefaultMemoryBytes, minMemoryBytes, maxMemoryBytes); err != nil {
@@ -258,10 +292,44 @@ func Load() (Config, error) {
 	if cfg.RuntimeNetwork != "" && !networkNamePattern.MatchString(cfg.RuntimeNetwork) {
 		return Config{}, fmt.Errorf("%s must be a docker network name", EnvRuntimeNetwork)
 	}
+	if path := strings.TrimSpace(os.Getenv(EnvDB)); path != "" {
+		cfg.DBPath = path
+	}
+	if err := checkDBPath(cfg.DBPath); err != nil {
+		return Config{}, fmt.Errorf("%s: %w", EnvDB, err)
+	}
+	if cfg.ReleaseHistory, err = envInt(EnvReleaseHistory, DefaultReleaseHistory, maxReleaseHistory); err != nil {
+		return Config{}, err
+	}
+	cfg.WebhookSecret = os.Getenv(EnvWebhookSecret)
+	if err := checkWebhookSecret(cfg.WebhookSecret); err != nil {
+		return Config{}, fmt.Errorf("%s is invalid", EnvWebhookSecret)
+	}
 	if err := checkListenAddr(cfg.ProxyAddr); err != nil {
 		return Config{}, fmt.Errorf("%s: %w", EnvProxyAddr, err)
 	}
 	return cfg, nil
+}
+
+func checkDBPath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" || strings.ContainsAny(path, "\x00\r\n") {
+		return fmt.Errorf("database path is invalid")
+	}
+	if path == MemoryDBPath {
+		return nil
+	}
+	if strings.HasPrefix(path, "-") {
+		return fmt.Errorf("database path is invalid")
+	}
+	return nil
+}
+
+func checkWebhookSecret(secret string) error {
+	if len(secret) > maxWebhookSecret || strings.ContainsRune(secret, 0) {
+		return fmt.Errorf("webhook secret is invalid")
+	}
+	return nil
 }
 
 func checkListenAddr(addr string) error {
@@ -286,14 +354,14 @@ func validHealthPath(path string) bool {
 	return true
 }
 
-func envInt(key string, def, min, max int) (int, error) {
+func envInt(key string, def, max int) (int, error) {
 	raw := strings.TrimSpace(os.Getenv(key))
 	if raw == "" {
 		return def, nil
 	}
 	n, err := strconv.Atoi(raw)
-	if err != nil || n < min || n > max {
-		return 0, fmt.Errorf("%s must be an integer from %d to %d", key, min, max)
+	if err != nil || n < 1 || n > max {
+		return 0, fmt.Errorf("%s must be an integer from 1 to %d", key, max)
 	}
 	return n, nil
 }

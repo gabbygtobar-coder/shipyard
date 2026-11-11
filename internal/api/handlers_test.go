@@ -349,3 +349,31 @@ func (s stubStore) WaitDeploymentLog(context.Context, string, int) error {
 func (s stubStore) SetAppStatus(context.Context, string, string, string) (store.App, error) {
 	return store.App{}, errors.New("status not stubbed")
 }
+
+func (s stubStore) ConfigureApp(context.Context, string, store.AppSettings) (store.App, error) {
+	return store.App{}, errors.New("configure not stubbed")
+}
+
+func (s stubStore) ListAppsByRepo(context.Context, string) ([]store.App, error) {
+	return nil, errors.New("list not stubbed")
+}
+
+func (s stubStore) ClaimDelivery(context.Context, string) (bool, error) {
+	return false, errors.New("delivery not stubbed")
+}
+
+func (s stubStore) ForgetDelivery(context.Context, string) error {
+	return errors.New("delivery not stubbed")
+}
+
+func (s stubStore) CreateRollback(context.Context, string, store.Release) (store.Deployment, error) {
+	return store.Deployment{}, errors.New("rollback not stubbed")
+}
+
+func (s stubStore) RecordRelease(context.Context, string, int) ([]store.Release, error) {
+	return nil, errors.New("release not stubbed")
+}
+
+func (s stubStore) ListReleases(context.Context, string) ([]store.Release, error) {
+	return nil, errors.New("release not stubbed")
+}

@@ -247,6 +247,24 @@ func TestImageUserAndCPU(t *testing.T) {
 	}
 }
 
+func TestDockerRemoveImage(t *testing.T) {
+	t.Parallel()
+	s := &script{}
+	d := testDocker(s)
+	tag := "shipyard/demo:0123456789ab"
+	if err := d.RemoveImage(context.Background(), tag); err != nil {
+		t.Fatal(err)
+	}
+	cmd := s.commands()[0]
+	want := []string{"rmi", "--", tag}
+	if cmd.name != "docker" || strings.Join(cmd.args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("command %#v", cmd)
+	}
+	if err := d.RemoveImage(context.Background(), "alpine:latest"); err == nil {
+		t.Fatal("expected an invalid tag")
+	}
+}
+
 func TestParseStatus(t *testing.T) {
 	t.Parallel()
 	status, err := parseStatus("abc", "false|137|died\n")

@@ -6,7 +6,9 @@ Milestone M0 is the control plane skeleton: `shipyardd` is an HTTP API and `ship
 
 Milestone M1 builds a Docker image from a registered repository. It clones the repo, requires a Dockerfile at the repository root, and tags the image `shipyard/<app>:<short-sha>`.
 
-Milestone M2 runs that image and routes traffic to it. After a build succeeds, `shipyardd` starts a container, waits until an HTTP health check passes, and only then marks the deployment `running`. A later healthy deployment takes over with a blue-green swap: traffic moves first, then the previous container stops. A reverse proxy on its own port routes `Host: <app>.localhost` and `/apps/<app>/` to the current container. Nothing about routing is written to disk. AWS and webhooks are later milestones.
+Milestone M2 runs that image and routes traffic to it. After a build succeeds, `shipyardd` starts a container, waits until an HTTP health check passes, and only then marks the deployment `running`. A later healthy deployment takes over with a blue-green swap: traffic moves first, then the previous container stops. A reverse proxy on its own port routes `Host: <app>.localhost` and `/apps/<app>/` to the current container. The route table itself is in memory. AWS is a later milestone.
+
+Milestone M4 is push-to-deploy and rollback, and it lands before M3. GitHub `push` events can queue a build, and `shipyard rollback` redeploys a retained image through the same health-gated swap. Both talk to the runtime only through the existing interfaces, so an ECS runtime can replace the local Docker runtime later without a second webhook or rollback implementation. Apps, deployments, and releases are stored in SQLite and survive a restart.
 
 ## Roadmap
 
@@ -15,8 +17,8 @@ Milestone M2 runs that image and routes traffic to it. After a build succeeds, `
 | M0 | HTTP API, CLI, and an in-memory app and deployment store |
 | M1 | Build a Docker image from a Git repository |
 | M2 | Run that image locally and route traffic with a reverse proxy |
-| M3 | Push the image to AWS ECR and run it on ECS Fargate, provisioned with Terraform |
-| M4 | Push-to-deploy from GitHub, plus rollback to a previous deployment |
+| M3 | Push the image to AWS ECR and run it on ECS Fargate, provisioned with Terraform. Not in this tree yet. |
+| M4 | Push-to-deploy from GitHub, rollback to a retained image, and a SQLite store. Works on the local Docker runtime. |
 | M5 | Health checks, metrics, operator docs, and a cost note for the AWS path |
 
 ## Out of scope
@@ -37,7 +39,7 @@ make run
 In another shell:
 
 ```bash
-./bin/shipyard apps create --name demo --repo https://github.com/golang/example
+./bin/shipyard apps create --name demo --repo https://github.com/golang/example --branch main
 ./bin/shipyard apps list
 ./bin/shipyard apps get demo
 curl -s localhost:8080/healthz
@@ -53,18 +55,22 @@ Building an image requires a Dockerfile at the root of the registered repository
 
 The CLI talks to `http://127.0.0.1:8080` unless you pass `--api-url` or set `SHIPYARD_API_URL`. Put `--api-url` before the command.
 
-`apps create` and `apps get` print one app as indented JSON. `apps list` prints `{"apps":[...]}`. `apps url` prints the public URL as a single line. `deploy` prints the new deployment. `deployments list` prints `{"deployments":[...]}`. `logs` prints the captured build and runtime log as plain text. `stop` prints the app after its container is stopped. `created_at` is UTC. Names are stored trimmed, and repository URLs are stored in canonical form (`https://github.com/<owner>/<repo>`, without a trailing `.git`).
+`apps create`, `apps update`, and `apps get` print one app as indented JSON. `apps list` prints `{"apps":[...]}`. `apps url` prints the public URL as a single line. `deploy` and `rollback` print the new deployment. `deployments list` prints `{"deployments":[...]}`. `releases` prints `{"releases":[...]}`. `logs` prints the captured build and runtime log as plain text. `stop` prints the app after its container is stopped. `created_at` is UTC. Names are stored trimmed, and repository URLs are stored in canonical form (`https://github.com/<owner>/<repo>`, without a trailing `.git`).
 
-Apps include `status`: `idle` until a deployment is healthy, `running` while traffic is routed, and `stopped` after `shipyard stop`. A running app also includes `url`.
+Apps include `branch` (default `main`), `auto_deploy` (default false), and `status`: `idle` until a deployment is healthy, `running` while traffic is routed, and `stopped` after `shipyard stop`. A running app also includes `url`. The per-app webhook secret is never returned.
 
 ### API
 
 | Method and path | Behavior |
 | --- | --- |
 | `GET /healthz` | `{"status":"ok"}` |
-| `POST /apps` | Register an app. Body: `{"name":"...","repo_url":"..."}`. `201` with the app, `Location: /apps/<name>`. |
+| `POST /apps` | Register an app. Body: `{"name":"...","repo_url":"...","branch":"main","auto_deploy":false,"webhook_secret":"..."}`. `branch`, `auto_deploy`, and `webhook_secret` are optional. `201` with the app, `Location: /apps/<name>`. The secret is not in the response. |
+| `PATCH /apps/{name}` | Change `branch`, `auto_deploy`, or `webhook_secret`. Omitted fields stay as they are. |
 | `GET /apps` | List apps in creation order: `{"apps":[...]}`. |
-| `GET /apps/{name}` | Fetch one app, including `status` and, when traffic is routed, `url`. |
+| `GET /apps/{name}` | Fetch one app, including `branch`, `auto_deploy`, `status`, and, when traffic is routed, `url`. |
+| `POST /webhooks/github` | GitHub webhook. See [Push-to-deploy](#push-to-deploy). |
+| `POST /apps/{name}/rollback` | Redeploy a retained image. Body may be empty or `{"deployment_id":"dep_1"}`. `202` with the new deployment. |
+| `GET /apps/{name}/releases` | Retained images, newest first: `{"releases":[...]}`. |
 | `GET /apps/{name}/url` | `{"url":"http://<app>.localhost:8081/"}` when the app is running. `409` when it is not. |
 | `POST /apps/{name}/stop` | Stop the container that is receiving traffic. `200` with the app. `409` when nothing is running. |
 | `POST /apps/{name}/deployments` | Queue an image build. Body may be empty or `{"ref":"..."}`. `202` with the deployment, `Location: /deployments/<id>`. |
@@ -85,7 +91,7 @@ Duplicate names return `409`. A valid name that is not registered returns `404`.
 
 Deployment records contain `id`, `app_name`, `ref`, `commit_sha`, `status`, `image_tag`, `url`, `error`, `created_at`, and, once a worker starts, `started_at` and `finished_at`. Status moves through `queued`, `building`, `starting`, and `running`. A build with no runtime still ends at `succeeded`. `failed` means the build or the health gate stopped. `stopped` means a running container was replaced or stopped with `shipyard stop`. `url` is set when the deployment becomes the one receiving traffic. The image tag is `shipyard/<app>:<12 hex chars of the commit>`.
 
-Restarting `shipyardd` drops apps, deployments, logs, and the routing table. That state is only in memory; durable storage can come later. A clean shutdown stops containers Shipyard started. The next start also removes containers labeled `shipyard.managed=true`, so a crash does not leave them running, but it does forget which app they belonged to.
+`shipyardd` stores apps, deployments, logs, webhook delivery ids, and releases in SQLite (`shipyard.db`, or `--db` / `SHIPYARD_DB`). `SHIPYARD_DB=memory` keeps the in-memory store used by tests. The distroless image sets `SHIPYARD_DB=memory` because that filesystem is not a place to keep a database. A restart keeps the records. It does not keep the route table or the containers: startup removes containers labeled `shipyard.managed=true`, marks a deployment that was `running` as `stopped`, and marks `queued`, `building`, or `starting` deployments `failed` with `interrupted by restart`. Roll back or deploy again to serve traffic. The webhook secret is stored for signature checks and is never written to the log.
 
 The M0 store helper `CreateDeployment` can still record a `pending` placeholder. The build pipeline does not use that status.
 
@@ -121,6 +127,9 @@ The build timeout (default 10m) covers the clone and `docker build`. The clone u
 | Health timeout | `--health-timeout` | `SHIPYARD_HEALTH_TIMEOUT` | `30s` |
 | Health interval | `--health-interval` | `SHIPYARD_HEALTH_INTERVAL` | `500ms` |
 | Docker network | `--runtime-network` | `SHIPYARD_RUNTIME_NETWORK` | empty. Empty publishes `127.0.0.1:<random>`. A name attaches the container to that network and does not publish a host port. |
+| Database | `--db` | `SHIPYARD_DB` | `shipyard.db`. `memory` uses the in-memory store. |
+| Release history | `--release-history` | `SHIPYARD_RELEASE_HISTORY` | `5` (1–50). Successful images kept per app. |
+| Webhook secret |  | `SHIPYARD_GITHUB_WEBHOOK_SECRET` | empty. Global HMAC secret. A per-app `webhook_secret` wins for that app. The value is not logged and is not a flag, so it does not appear in the process arguments. |
 
 ### Architecture
 
@@ -128,7 +137,7 @@ The build timeout (default 10m) covers the clone and `docker build`. The clone u
 shipyard CLI
     |
     v
-shipyardd API (:8080) --> in-memory store
+shipyardd API (:8080) --> store (SQLite, or memory in tests)
     |
     +--> Runner (bounded worker pool)
     |       +--> source.Cloner    git fetch --depth 1
@@ -194,7 +203,74 @@ curl -fsS -H 'Host: hello.localhost' http://127.0.0.1:8081/
 ./bin/shipyard stop hello
 ```
 
-`logs --follow` exits when the deployment is `running`. The path URL works without DNS for `*.localhost`. The host URL works where the resolver answers `*.localhost` with `127.0.0.1`. `make test-integration` runs this same hello image through the proxy without a GitHub round trip.
+`logs --follow` exits when the deployment is `running`. The path URL works without DNS for `*.localhost`. The host URL works where the resolver answers `*.localhost` with `127.0.0.1`. `make test-integration` runs this same hello image through the proxy without a GitHub round trip. The page includes `version`, taken from the image `VERSION` build arg, so a rollback is visible in the body.
+
+## Push-to-deploy
+
+`POST /webhooks/github` accepts GitHub webhook deliveries.
+
+1. Read the raw body. The signature is the HMAC-SHA256 of those exact bytes.
+2. Compare `X-Hub-Signature-256` (`sha256=` plus hex) with the app secret, or with `SHIPYARD_GITHUB_WEBHOOK_SECRET` when the app has none. The compare is constant time. A missing or wrong signature is `401`. The secret is never logged.
+3. `X-GitHub-Event: ping` is `200` `{"status":"pong"}`. Any other event except `push` is `202` `{"status":"ignored"}`.
+4. A `push` is deployed only when the app's `auto_deploy` is true and `ref` is `refs/heads/<branch>` for that app's `branch` (default `main`). Anything else, including a deleted branch, is `202` ignored.
+5. `X-GitHub-Delivery` is stored. The same id is `202` `{"status":"duplicate"}` and does not start another build.
+6. If that app already has a build waiting in the queue, the queued deployment is updated to the newest commit instead of enqueueing another one. A build that has already started is left alone. The next push queues one new build.
+
+Create the app with auto-deploy on, and give GitHub either the global secret or the per-app secret:
+
+```bash
+export SHIPYARD_GITHUB_WEBHOOK_SECRET='choose-a-long-secret'
+./bin/shipyard apps create --name hello --repo https://github.com/<owner>/<repo> --branch main --auto-deploy
+```
+
+In the GitHub repository, add a webhook: payload URL `https://<public-host>/webhooks/github`, content type `application/json`, secret equal to `SHIPYARD_GITHUB_WEBHOOK_SECRET`, events **Just the push event**. The per-app secret is `apps create --webhook-secret` or `apps update NAME --webhook-secret`. An app that has its own secret does not accept the global one.
+
+`shipyardd` listens on localhost. To show a delivery from GitHub, expose port 8080 with either tool, then put that HTTPS URL in the webhook:
+
+- [ngrok](https://ngrok.com/): `ngrok http 8080`, and use `https://<subdomain>.ngrok.io/webhooks/github`.
+- [smee.io](https://smee.io/): create a channel, set that URL as the GitHub payload URL, and run `smee --url https://smee.io/<channel> --target http://127.0.0.1:8080/webhooks/github`.
+
+Both are optional. A `curl` with a correctly signed body hits the same endpoint.
+
+## Rollback
+
+A deployment that reaches `running` (or `succeeded`, when no runtime is configured) is a release. Shipyard keeps the last `--release-history` images per app, default 5. Older images are dropped. On the local runtime the dropped tag is removed with `docker rmi` when nothing retained still uses it. An ECS runtime can implement the same image-removal interface later.
+
+`shipyard rollback` does not clone or build. It starts the retained image and waits for the same health gate. Traffic moves only after that check passes. If the new container fails the health check, the previous container keeps serving.
+
+```bash
+./bin/shipyard releases hello
+./bin/shipyard rollback hello
+./bin/shipyard rollback hello --to dep_1
+curl -fsS http://127.0.0.1:8081/apps/hello/
+```
+
+With no `--to`, rollback redeploys the release before the one that is running. When nothing is running, it redeploys the newest retained image. `--to` must be one of the retained deployment ids.
+
+### ROLLBACK demo
+
+`examples/hello` bakes a `VERSION` build arg into the page (the Dockerfile default is `dev`). A normal deploy does not pass build args, so two commits need to contain two different pages, or two different `ARG VERSION` defaults. After the first is serving, deploy the second, then roll back. The proxy returns the first page again, and the second container is stopped only once the first image is healthy.
+
+```bash
+make build
+make run
+```
+
+```bash
+./bin/shipyard apps create --name hello --repo https://github.com/<owner>/<repo> --branch main
+./bin/shipyard deploy hello --ref <commit-v1>
+./bin/shipyard logs dep_1 --follow
+curl -fsS http://127.0.0.1:8081/apps/hello/
+./bin/shipyard deploy hello --ref <commit-v2>
+./bin/shipyard logs dep_2 --follow
+curl -fsS http://127.0.0.1:8081/apps/hello/
+./bin/shipyard releases hello
+./bin/shipyard rollback hello --to dep_1
+./bin/shipyard logs dep_3 --follow
+curl -fsS http://127.0.0.1:8081/apps/hello/
+```
+
+The integration test does this without GitHub: it builds the hello image twice with `VERSION=v1` and `VERSION=v2`, serves v2, rolls back to the v1 image, and checks that the proxy body contains `version v1`.
 
 To run `shipyardd` itself in a container with the Docker socket:
 
@@ -229,12 +305,12 @@ make test-integration   # needs Docker; builds, runs, and proxies examples/hello
 curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v1.61.0/install.sh | sh -s -- -b "$(go env GOPATH)/bin" v1.61.0
 ```
 
-GitHub Actions runs vet, golangci-lint, `go test -race` with coverage, the integration test against [`examples/hello`](examples/hello), and `docker build` of the distroless `shipyardd` image. The integration test builds `shipyard/hello:0123456789ab`, runs it, requests it through the proxy, checks the body, and removes the container and image.
+GitHub Actions runs vet, golangci-lint, `go test -race` with coverage, the integration test against [`examples/hello`](examples/hello), and `docker build` of the distroless `shipyardd` image. The integration test builds `examples/hello` twice with `VERSION=v1` and `VERSION=v2`, serves v2, rolls back to the v1 image, checks that the proxy body contains `version v1`, and removes the containers and images.
 
 ## Layout
 
 - `cmd/shipyardd` — HTTP API, build workers, container supervisor, and reverse proxy
-- `cmd/shipyard` — CLI (`apps`, `deploy`, `deployments list`, `logs`, `stop`)
+- `cmd/shipyard` — CLI (`apps`, `deploy`, `deployments list`, `releases`, `rollback`, `logs`, `stop`)
 - `internal/api` — routing, handlers, and input validation (`net/http`, `log/slog`)
 - `internal/deploy` — build queue, status transitions, timeouts, and log capture
 - `internal/source` — `Cloner` interface, `git` implementation, and test fake
@@ -242,7 +318,8 @@ GitHub Actions runs vet, golangci-lint, `go test -race` with coverage, the integ
 - `internal/runtime` — `Runtime` and health-check interfaces, Docker implementation, fakes, and the blue-green supervisor
 - `internal/proxy` — reverse proxy and public URL
 - `internal/route` — in-memory table of the container currently serving each app
-- `internal/store` — `Store` interface and the in-memory app, deployment, and log store
+- `internal/store` — `Store` interface, the in-memory store, SQLite, and migrations
+- `internal/webhook` — GitHub HMAC verification and push parsing
 - `internal/config` — listen addresses, API URL, build limits, and runtime limits
 - `examples/hello` — static nginx app built, run, and proxied by the integration test
 - `docker-compose.yml` — `shipyardd` with the Docker socket and the `shipyard` network

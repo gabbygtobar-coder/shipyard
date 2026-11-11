@@ -10,14 +10,26 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/gabbygtobar-coder/shipyard/internal/giturl"
 	"github.com/gabbygtobar-coder/shipyard/internal/store"
 )
 
 const errInvalidApp = "invalid app"
 
+const errWebhookSecret = "webhook_secret is invalid"
+
 type createAppRequest struct {
-	Name    string `json:"name"`
-	RepoURL string `json:"repo_url"`
+	Name          string `json:"name"`
+	RepoURL       string `json:"repo_url"`
+	Branch        string `json:"branch"`
+	AutoDeploy    bool   `json:"auto_deploy"`
+	WebhookSecret string `json:"webhook_secret"`
+}
+
+type updateAppRequest struct {
+	Branch        *string `json:"branch"`
+	AutoDeploy    *bool   `json:"auto_deploy"`
+	WebhookSecret *string `json:"webhook_secret"`
 }
 
 type appListResponse struct {
@@ -56,8 +68,17 @@ func (h *handler) createApp(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	settings, err := appSettings(req.Branch, req.AutoDeploy, req.WebhookSecret)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
-	app, err := h.store.CreateApp(r.Context(), name, repoURL)
+	if _, err := h.store.CreateApp(r.Context(), name, repoURL); err != nil {
+		h.writeStoreError(w, err, errAppNotFound)
+		return
+	}
+	app, err := h.store.ConfigureApp(r.Context(), name, settings)
 	if err != nil {
 		h.writeStoreError(w, err, errAppNotFound)
 		return
@@ -76,6 +97,61 @@ func (h *handler) listApps(w http.ResponseWriter, r *http.Request) {
 		apps = []store.App{}
 	}
 	writeJSON(w, http.StatusOK, appListResponse{Apps: apps})
+}
+
+func (h *handler) updateApp(w http.ResponseWriter, r *http.Request) {
+	name := strings.TrimSpace(r.PathValue("name"))
+	if err := ValidateName(name); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req updateAppRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	app, err := h.store.GetApp(r.Context(), name)
+	if err != nil {
+		h.writeStoreError(w, err, errAppNotFound)
+		return
+	}
+	branch := app.Branch
+	auto := app.AutoDeploy
+	secret := app.WebhookSecret
+	if req.Branch != nil {
+		branch = *req.Branch
+	}
+	if req.AutoDeploy != nil {
+		auto = *req.AutoDeploy
+	}
+	if req.WebhookSecret != nil {
+		secret = *req.WebhookSecret
+	}
+	settings, err := appSettings(branch, auto, secret)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	app, err = h.store.ConfigureApp(r.Context(), name, settings)
+	if err != nil {
+		h.writeStoreError(w, err, errAppNotFound)
+		return
+	}
+	writeJSON(w, http.StatusOK, app)
+}
+
+func appSettings(branch string, auto bool, secret string) (store.AppSettings, error) {
+	branch = strings.TrimSpace(branch)
+	if branch == "" {
+		branch = store.DefaultBranch
+	}
+	if err := giturl.ValidateRef(branch); err != nil {
+		return store.AppSettings{}, err
+	}
+	if len(secret) > store.MaxWebhookSecretBytes || strings.ContainsRune(secret, 0) {
+		return store.AppSettings{}, errors.New(errWebhookSecret)
+	}
+	return store.AppSettings{Branch: branch, AutoDeploy: auto, WebhookSecret: secret}, nil
 }
 
 func (h *handler) getApp(w http.ResponseWriter, r *http.Request) {
@@ -119,7 +195,7 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	mediaType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || mediaType != "application/json" {
+	if err != nil || mediaType != mediaTypeJSON {
 		return &httpStatusError{status: http.StatusUnsupportedMediaType, msg: errContentType}
 	}
 
@@ -133,7 +209,7 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 		return nil
 	}
 	if trailing == nil {
-		return errors.New("multiple JSON values")
+		return errors.New(errMultipleJSON)
 	}
 	return classifyDecodeError(trailing)
 }

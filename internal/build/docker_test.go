@@ -131,6 +131,25 @@ func TestValidateTag(t *testing.T) {
 	}
 }
 
+func TestDockerBuildWithArgs(t *testing.T) {
+	t.Parallel()
+	s := &script{}
+	d := testDocker(s)
+	dir := t.TempDir()
+	tag := "shipyard/demo:0123456789ab"
+	if err := d.BuildWithArgs(context.Background(), dir, tag, map[string]string{"VERSION": "v1"}, nil); err != nil {
+		t.Fatal(err)
+	}
+	cmd := s.commands()[0]
+	want := []string{"build", "--progress=plain", "--build-arg", "VERSION=v1", "-t", tag, "--", dir}
+	if strings.Join(cmd.args, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("args = %#v", cmd.args)
+	}
+	if err := d.BuildWithArgs(context.Background(), dir, tag, map[string]string{"version": "v1"}, nil); err == nil {
+		t.Fatal("expected a rejected build arg")
+	}
+}
+
 func TestDockerBuildMissingBinary(t *testing.T) {
 	t.Parallel()
 	d := &Docker{
