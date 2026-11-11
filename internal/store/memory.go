@@ -66,6 +66,7 @@ func (m *Memory) CreateApp(ctx context.Context, name, repoURL string) (App, erro
 	app := App{
 		Name:      name,
 		RepoURL:   repoURL,
+		Status:    AppStatusIdle,
 		CreatedAt: m.now().UTC(),
 	}
 	m.apps[name] = app
@@ -107,6 +108,31 @@ func (m *Memory) ListApps(ctx context.Context) ([]App, error) {
 		apps = append(apps, m.apps[name])
 	}
 	return apps, nil
+}
+
+// SetAppStatus implements Store.
+func (m *Memory) SetAppStatus(ctx context.Context, name, status, appURL string) (App, error) {
+	if err := ctx.Err(); err != nil {
+		return App{}, err
+	}
+	name = strings.TrimSpace(name)
+	status = strings.TrimSpace(status)
+	appURL = strings.TrimSpace(appURL)
+	if name == "" || !validAppStatus(status, appURL) {
+		return App{}, ErrInvalid
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	app, ok := m.apps[name]
+	if !ok {
+		return App{}, ErrNotFound
+	}
+	app.Status = status
+	app.URL = appURL
+	m.apps[name] = app
+	return app, nil
 }
 
 // CreateDeployment implements Store.
@@ -188,6 +214,9 @@ func (m *Memory) UpdateDeployment(ctx context.Context, id string, upd Deployment
 		trimmed := (*upd.Error)[:4096]
 		upd.Error = &trimmed
 	}
+	if upd.URL != nil && len(strings.TrimSpace(*upd.URL)) > 2048 {
+		return Deployment{}, ErrInvalid
+	}
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -196,20 +225,30 @@ func (m *Memory) UpdateDeployment(ctx context.Context, id string, upd Deployment
 	if !ok {
 		return Deployment{}, ErrNotFound
 	}
-	if IsTerminalStatus(dep.Status) {
-		if deploymentUpdateChanges(dep, upd) {
-			return Deployment{}, ErrInvalid
-		}
-		return cloneDeployment(dep), nil
-	}
+	nextStatus := dep.Status
+	statusChange := false
 	if upd.Status != nil {
-		status := strings.TrimSpace(*upd.Status)
-		if status != dep.Status {
-			if !validDeploymentStatus(status) || !CanTransition(dep.Status, status) {
+		nextStatus = strings.TrimSpace(*upd.Status)
+		if nextStatus != dep.Status {
+			statusChange = true
+			if !validDeploymentStatus(nextStatus) || !CanTransition(dep.Status, nextStatus) {
 				return Deployment{}, ErrInvalid
 			}
-			dep.Status = status
 		}
+	}
+	if !mutableDeployment(dep.Status) {
+		if !statusChange {
+			if deploymentUpdateChanges(dep, upd) {
+				return Deployment{}, ErrInvalid
+			}
+			return cloneDeployment(dep), nil
+		}
+		if deploymentFieldsChange(dep, upd) {
+			return Deployment{}, ErrInvalid
+		}
+	}
+	if statusChange {
+		dep.Status = nextStatus
 	}
 	if upd.Ref != nil {
 		dep.Ref = strings.TrimSpace(*upd.Ref)
@@ -219,6 +258,9 @@ func (m *Memory) UpdateDeployment(ctx context.Context, id string, upd Deployment
 	}
 	if upd.ImageTag != nil {
 		dep.ImageTag = strings.TrimSpace(*upd.ImageTag)
+	}
+	if upd.URL != nil {
+		dep.URL = strings.TrimSpace(*upd.URL)
 	}
 	if upd.Error != nil {
 		dep.Error = strings.TrimSpace(*upd.Error)
@@ -382,6 +424,10 @@ func deploymentUpdateChanges(dep Deployment, upd DeploymentUpdate) bool {
 	if upd.Status != nil && strings.TrimSpace(*upd.Status) != dep.Status {
 		return true
 	}
+	return deploymentFieldsChange(dep, upd)
+}
+
+func deploymentFieldsChange(dep Deployment, upd DeploymentUpdate) bool {
 	if upd.Ref != nil && strings.TrimSpace(*upd.Ref) != dep.Ref {
 		return true
 	}
@@ -389,6 +435,9 @@ func deploymentUpdateChanges(dep Deployment, upd DeploymentUpdate) bool {
 		return true
 	}
 	if upd.ImageTag != nil && strings.TrimSpace(*upd.ImageTag) != dep.ImageTag {
+		return true
+	}
+	if upd.URL != nil && strings.TrimSpace(*upd.URL) != dep.URL {
 		return true
 	}
 	if upd.Error != nil && strings.TrimSpace(*upd.Error) != dep.Error {
@@ -401,6 +450,26 @@ func deploymentUpdateChanges(dep Deployment, upd DeploymentUpdate) bool {
 		return true
 	}
 	return false
+}
+
+func mutableDeployment(status string) bool {
+	switch status {
+	case DeploymentStatusPending, DeploymentStatusQueued, DeploymentStatusBuilding, DeploymentStatusStarting:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAppStatus(status, appURL string) bool {
+	switch status {
+	case AppStatusIdle, AppStatusStopped:
+		return appURL == ""
+	case AppStatusRunning:
+		return appURL != "" && len(appURL) <= 2048
+	default:
+		return false
+	}
 }
 
 func cloneDeployment(dep Deployment) Deployment {

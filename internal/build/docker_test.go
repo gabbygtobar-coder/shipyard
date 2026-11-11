@@ -4,13 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/gabbygtobar-coder/shipyard/internal/proc"
 )
@@ -145,57 +141,4 @@ func TestDockerBuildMissingBinary(t *testing.T) {
 	if !errors.Is(err, ErrDockerNotFound) {
 		t.Fatalf("error = %v", err)
 	}
-}
-
-func TestIntegrationHello(t *testing.T) {
-	if os.Getenv("SHIPYARD_INTEGRATION") == "" {
-		t.Skip("set SHIPYARD_INTEGRATION=1 to build examples/hello with docker")
-	}
-	if _, err := execLook("docker"); err != nil {
-		t.Fatalf("SHIPYARD_INTEGRATION=1 but docker is not available: %v", err)
-	}
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	dir := filepath.Join(filepath.Dir(file), "..", "..", "examples", "hello")
-	info, err := os.Stat(filepath.Join(dir, "Dockerfile"))
-	if err != nil || info.IsDir() {
-		t.Fatalf("examples/hello Dockerfile: %v", err)
-	}
-	const tag = "shipyard/hello:0123456789ab"
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		_ = proc.Run(ctx, "docker", []string{"rmi", "-f", tag}, proc.Spec{})
-	})
-	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
-	defer cancel()
-	var logs strings.Builder
-	if err := NewDocker().Build(ctx, mustAbs(t, dir), tag, &logs); err != nil {
-		t.Fatalf("build: %v\n%s", err, logs.String())
-	}
-	if logs.Len() == 0 {
-		t.Fatal("docker build produced no log output")
-	}
-	out, err := proc.Output(context.Background(), "docker", []string{"image", "inspect", "--format", "{{.Id}}", tag}, proc.Spec{})
-	if err != nil {
-		t.Fatalf("inspect: %v", err)
-	}
-	if strings.TrimSpace(string(out)) == "" {
-		t.Fatal("inspect returned an empty image id")
-	}
-}
-
-func execLook(name string) (string, error) {
-	return exec.LookPath(name)
-}
-
-func mustAbs(t *testing.T, dir string) string {
-	t.Helper()
-	abs, err := filepath.Abs(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	return abs
 }

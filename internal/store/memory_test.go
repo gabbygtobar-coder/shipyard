@@ -517,6 +517,77 @@ func TestMemoryLogTruncationAndWait(t *testing.T) {
 
 func strPtr(s string) *string { return &s }
 
+func TestMemoryRunStatusAndAppURL(t *testing.T) {
+	t.Parallel()
+	st := NewMemory()
+	ctx := context.Background()
+	app, err := st.CreateApp(ctx, "demo", "https://github.com/acme/demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if app.Status != AppStatusIdle || app.URL != "" {
+		t.Fatalf("new app = %#v", app)
+	}
+	dep, err := st.CreateDeployment(ctx, "demo", DeploymentStatusStarting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	running := DeploymentStatusRunning
+	url := "http://demo.localhost:8081/"
+	now := time.Now().UTC()
+	got, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{
+		Status:     &running,
+		URL:        &url,
+		FinishedAt: &now,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != DeploymentStatusRunning || got.URL != url || got.FinishedAt == nil {
+		t.Fatalf("running = %#v", got)
+	}
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{URL: strPtr("http://other")}); !errors.Is(err, ErrInvalid) {
+		t.Fatal("running deployment accepted a field change")
+	}
+	updated, err := st.SetAppStatus(ctx, "demo", AppStatusRunning, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status != AppStatusRunning || updated.URL != url {
+		t.Fatalf("app = %#v", updated)
+	}
+	if _, err := st.SetAppStatus(ctx, "demo", AppStatusRunning, ""); !errors.Is(err, ErrInvalid) {
+		t.Fatal("running app without a url was accepted")
+	}
+	if _, err := st.SetAppStatus(ctx, "demo", AppStatusIdle, url); !errors.Is(err, ErrInvalid) {
+		t.Fatal("idle app with a url was accepted")
+	}
+	stopped := DeploymentStatusStopped
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &stopped}); err != nil {
+		t.Fatal(err)
+	}
+	final, err := st.GetDeployment(ctx, dep.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.Status != DeploymentStatusStopped || final.URL != url {
+		t.Fatalf("stopped = %#v", final)
+	}
+	if _, err := st.UpdateDeployment(ctx, dep.ID, DeploymentUpdate{Status: &running}); !errors.Is(err, ErrInvalid) {
+		t.Fatal("stopped deployment changed status")
+	}
+	snap, err := st.ReadDeploymentLog(ctx, dep.ID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.Terminal {
+		t.Fatal("stopped deployment is not terminal for logs")
+	}
+	if _, err := st.SetAppStatus(ctx, "missing", AppStatusStopped, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("missing app error = %v", err)
+	}
+}
+
 func TestMemoryConcurrentCreates(t *testing.T) {
 	t.Parallel()
 	st := NewMemory()
